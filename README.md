@@ -20,7 +20,7 @@ cargo run -p cowl-cli -- analyze examples/demo.c | jq .report.metrics
 cargo run -p cowl-cli -- graph examples/uaf_alias.c | dot -Tsvg > g.svg
 ```
 
-JSON API（MCP / VSCode拡張はこれを spawn する）:
+JSON API（VSCode拡張が spawn する。MCPサーバ cowl-mcp は同一プロセスで同じ契約を直接叩く: ADR-0004）:
 
 ```bash
 echo '{"cmd":"analyze","source":"void f(void){char*p=malloc(4);}","file_name":"x.c"}' \
@@ -31,12 +31,13 @@ echo '{"cmd":"analyze","source":"void f(void){char*p=malloc(4);}","file_name":"x
 
 ```
 cowl-cli ──► cowl-api ──► cowl-front-ts ──► cowl-core
- (clap)     (JSON契約)    (tree-sitter L1)   (facts / analysis / render)
+cowl-mcp ──┘
+ (clap/rmcp) (JSON契約)   (tree-sitter L1)   (facts / analysis / render)
 ```
 
 - 詳細な規約とレイヤ責務: **CLAUDE.md**（プロジェクト憲法）
 - 設計判断: docs/adr/
-- 今後のタスク: ROADMAP.md（W1: MCPサーバ, W2: VSCode拡張, W5: libclang L2 …）
+- 今後のタスク: ROADMAP.md（W2: VSCode拡張, W3: L1精度向上, W5: libclang L2 …）
 
 ## 何が見えるか（examples/demo.c）
 

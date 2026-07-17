@@ -5,8 +5,9 @@
 //!
 //! 1. **Rust関数API** … CLIのように同一プロセスでリンクする消費者向け
 //! 2. **JSON API** … `dispatch_json(&str) -> String`。
-//!    プロセス境界を越える消費者（MCPサーバ、VSCode拡張が spawn する
-//!    `cowl serve --stdio`）はこちらを叩く
+//!    プロセス境界を越える消費者（VSCode拡張が spawn する `cowl serve --stdio`）はこちらを叩く。
+//!    MCPサーバ cowl-mcp は同一プロセスで dispatch_json を直接呼ぶ
+//!    （エンベロープ形状をCLIと一致させるため。ADR-0004）
 //!
 //! ## 契約
 //! - リクエストは `{"cmd": "...", ...params}`（internally tagged）
@@ -15,9 +16,9 @@
 //!   プロセス管理だけに集中できるようにするため
 //! - 破壊的変更をするときは `API_VERSION` を上げ、ADRを書く
 //!
-//! ## MCP化の見取り図（将来ワーカーへの指示）
+//! ## MCP化の見取り図（実装済み: crates/cowl-mcp、ADR-0004）
 //! MCPツール `cowl_analyze` / `cowl_report_html` / `cowl_graph_dot` は
-//! それぞれ Request::Analyze / RenderHtml / RenderDot に1対1で写像すればよい。
+//! それぞれ Request::Analyze / RenderHtml / RenderDot に1対1で写像している。
 //! 新しい機能はまずここに Request を足す → CLI/MCP/拡張が同時に使えるようになる。
 
 use anyhow::Result;

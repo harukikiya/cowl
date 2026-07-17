@@ -1,0 +1,17 @@
+[package]
+name = "cowl-mcp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+cowl-api = { path = "../cowl-api" }
+rmcp.workspace = true
+tokio.workspace = true
+schemars.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+
+[dev-dependencies]
+rmcp = { workspace = true, features = ["client"] }
