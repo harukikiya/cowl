@@ -1,0 +1,66 @@
+// =============================================================================
+// cowl 開発コンテナ
+//
+// ■ Claude Code のログインが飛ぶ問題への対策（kanicc で踏んだ既知バグ）
+//   症状: コンテナ内の ~/.claude が root 所有で作られ、Claude Code が
+//         認証情報を書けず、起動のたびにログインを要求される
+//   対策（3点セット）:
+//     1. initializeCommand … ホスト側で ~/.claude と ~/.claude.json を先に作る。
+//        ※ 存在しないファイルを bind mount すると Docker が「ディレクトリ」を
+//          root 所有で作ってしまうのが根本原因のひとつ。先に touch して潰す
+//     2. mounts … ホストの認証情報をそのまま bind mount。
+//        ホストでログイン済みなら、コンテナ内でも即ログイン済みになる
+//     3. postCreateCommand(post-create.sh) … 念のため所有権を remoteUser に
+//        chown し、~/.claude.json がディレクトリ化していたら警告する
+//
+// ■ プラットフォームについて
+//   kanicc と違い x86-64 アセンブリへの依存が無いので platform 固定はしない。
+//   Apple Silicon (arm64) でもネイティブにビルドできる（tree-sitter は
+//   cc クレート経由で C 文法をローカルビルドするだけ）
+// =============================================================================
+{
+  "name": "cowl-dev",
+  "build": {
+    "dockerfile": "Dockerfile"
+  },
+
+  // Claude Code は Node.js が必要。イメージ側でなく feature で入れるのは
+  // ベースイメージ更新に追従しやすくするため
+  "features": {
+    "ghcr.io/devcontainers/features/node:1": {
+      "version": "22"
+    }
+  },
+
+  // --- 認証対策 1/3: ホスト側の事前準備（コンテナ作成前にホストで実行される）
+  "initializeCommand": "mkdir -p \"${localEnv:HOME}/.claude\" && touch \"${localEnv:HOME}/.claude.json\"",
+
+  // --- 認証対策 2/3: ホストの認証情報を共有
+  //   consistency=cached は macOS のバインドマウント高速化
+  "mounts": [
+    "source=${localEnv:HOME}/.claude,target=/home/vscode/.claude,type=bind,consistency=cached",
+    "source=${localEnv:HOME}/.claude.json,target=/home/vscode/.claude.json,type=bind,consistency=cached"
+  ],
+
+  // 非rootユーザで動かす。updateRemoteUserUID がホストの UID/GID に
+  // 揃えてくれるので、bind mount したファイルの所有権が噛み合う（Linuxホスト対策）
+  "remoteUser": "vscode",
+  "updateRemoteUserUID": true,
+
+  // --- 認証対策 3/3 ＋ 開発準備（chown・Claude Code導入・cargo fetch）
+  "postCreateCommand": "bash .devcontainer/post-create.sh",
+
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "rust-lang.rust-analyzer",
+        "tamasfe.even-better-toml",
+        "vadimcn.vscode-lldb"
+      ],
+      "settings": {
+        // 保存時に cargo check 相当。clippy まで回すのは重いので手動/CI に寄せる
+        "rust-analyzer.check.command": "check"
+      }
+    }
+  }
+}
