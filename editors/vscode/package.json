@@ -1,0 +1,43 @@
+{
+  "name": "cowl-vscode",
+  "displayName": "cowl",
+  "description": "C ownership & lifetime visualizer — 編集中バッファのライフタイム帯レポートを表示する",
+  "publisher": "cowl-dev",
+  "version": "0.1.0",
+  "private": true,
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "categories": [
+    "Visualization"
+  ],
+  "main": "./out/extension.js",
+  "activationEvents": [],
+  "contributes": {
+    "commands": [
+      {
+        "command": "cowl.showReport",
+        "title": "cowl: Show Ownership Report"
+      }
+    ],
+    "configuration": {
+      "title": "cowl",
+      "properties": {
+        "cowl.serverPath": {
+          "type": "string",
+          "default": "cowl",
+          "description": "cowl 実行ファイルのパス。PATH に無い場合は絶対パスを指定する（VS Code の設定値は変数展開されないため、${workspaceFolder} ではなく実際の絶対パスを書くこと。例: /workspaces/cowl/target/debug/cowl）"
+        }
+      }
+    }
+  },
+  "scripts": {
+    "build": "tsc",
+    "test": "tsc && node --test \"test/**/*.test.mjs\""
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@types/vscode": "~1.90.0",
+    "typescript": "^5.5.0"
+  }
+}

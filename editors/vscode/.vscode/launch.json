@@ -1,0 +1,16 @@
+{
+  // F5 で Extension Development Host を起動する構成。
+  // preLaunchTask の "npm: build" は VS Code の npm スクリプト自動検出で
+  // 解決される（tasks.json は不要）
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Run cowl Extension",
+      "type": "extensionHost",
+      "request": "launch",
+      "args": ["--extensionDevelopmentPath=${workspaceFolder}"],
+      "outFiles": ["${workspaceFolder}/out/**/*.js"],
+      "preLaunchTask": "npm: build"
+    }
+  ]
+}

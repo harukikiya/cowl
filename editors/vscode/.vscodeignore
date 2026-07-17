@@ -1,0 +1,8 @@
+# vsce パッケージング時に含めないもの（W2 では private:true で配布しないが、
+# out/ だけが実体という構成を明文化しておく）
+.vscode/**
+src/**
+test/**
+node_modules/**
+tsconfig.json
+**/*.map
