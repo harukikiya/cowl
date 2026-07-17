@@ -29,11 +29,18 @@
   demo.c 実バッファでのデータパス確認＋手動手順（editors/vscode/README.md）
   で受け入れ。claude ワーカー実装＋qa-reviewer（P0ゼロ、P1 3点反映済み）
 
-## W3: L1 精度向上（表の拡充と小さな穴埋め）
+## W3: L1 精度向上（表の拡充と小さな穴埋め） [x]
 - 内容: BENIGN_FNS / CONSUMER_FNS の拡充（POSIX頻出分）、
   `realloc` の引数位置対応（第1引数のみ消費）、`fopen`系の追加検討
 - 担当: frontend-worker ＋ qa-reviewer
 - 受け入れ: 追加1関数につきテスト1本 / manpage 確認をコミットメッセージに明記
+- [x] 完了 (2026-07-17): cfabf08 — CONSUMER_FNS を位置付き表に変更、
+  ALLOC 6・BENIGN 13・CONSUMER 4 関数追加（manpage 確認表はコミット
+  メッセージ）。fopen 系は AllocSource::Heap{func} 流用でスキーマ不変
+  （専用 variant は L2 課題）。あわせて `p = realloc(p, n)` が偽診断に
+  なるイベント順序バグを実測→修正（代入イベントは右辺終端でソート。
+  同一文内に限定、規約2に不抵触なことを qa が独立検証）。既存 examples
+  の出力はバイト一致で回帰なし。frontend-worker 実装＋qa-reviewer 承認
 
 ## W4: 指標の第2陣
 - 内容: Free-Site Multiplicity / Live-Range Length / Transfer Density を
