@@ -8,7 +8,7 @@ CLI / MCPサーバ / VSCode拡張 はすべてその皮に過ぎない。
 
 ```
 cowl-cli ──► cowl-api ──► cowl-front-ts ──► cowl-core
-   │            │              │                ├─ facts       事実IR（契約）
+cowl-mcp ──┘    │              │                ├─ facts       事実IR（契約）
  薄い殻     JSON契約      C→facts変換のみ       ├─ analysis    状態機械・指標・グラフ
                           (tree-sitter L1)      └─ render_*    HTML / DOT
 ```
@@ -19,6 +19,7 @@ cowl-cli ──► cowl-api ──► cowl-front-ts ──► cowl-core
 | cowl-front-ts | 構文事実の抽出 | 所有権の**解釈**・診断・指標計算 |
 | cowl-api | Request/Response の写像 | 解析ロジックの実装 |
 | cowl-cli | 引数→Request の写像 | ロジック全般 |
+| cowl-mcp | MCPツール→Request の写像（rmcp。ADR-0004） | ロジック全般・エンベロープの再解釈 |
 
 ## コマンド
 
@@ -28,6 +29,7 @@ make test      # cargo test --workspace
 make demo      # examples/ → out/*.html, out/*.dot を再生成
 cargo run -p cowl-cli -- report examples/demo.c -o out/demo.html
 echo '{"cmd":"version"}' | cargo run -q -p cowl-cli -- serve --stdio   # JSON API手打ち
+cargo run -p cowl-mcp   # MCPサーバ(stdio)。検証: npx @modelcontextprotocol/inspector --cli target/debug/cowl-mcp --method tools/list
 ```
 
 ## 絶対規約（違反はマージ不可）

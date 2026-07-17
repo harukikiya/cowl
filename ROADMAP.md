@@ -4,13 +4,18 @@
 担当エージェント・受け入れ条件・触ってよいファイルを添えて委任する。
 完了したら [x] を付け、成果への1行リンク（コミット/PR）を残す。
 
-## W1: MCP サーバ
+## W1: MCP サーバ [x]
 - 内容: `cowl serve --stdio` をラップする MCP サーバを追加する
   （crates/cowl-mcp/ 新設。rmcp を想定。ツールは cowl_analyze /
   cowl_report_html / cowl_graph_dot の3本、Request と1対1写像）
 - 担当: frontend-worker 以外なら可（analysis-worker 推奨）＋ qa-reviewer
 - 受け入れ: MCP Inspector で3ツールが呼べる / 依存追加のADRあり / make check 緑
 - 備考: JSON契約は cowl-api にしか無い前提を崩さない（ロジック再実装禁止）
+- [x] 完了 (2026-07-17): 4c3af69 — rmcp 2.2 で crates/cowl-mcp 新設。
+  「ラップ」は spawn でなく同一プロセスで dispatch_json を叩く形（ADR-0004）。
+  テスト4本（duplex での MCP プロトコル統合含む）。Inspector CLI で
+  3ツールの tools/call とエラー系（isError:true）を確認。analysis-worker
+  実装＋qa-reviewer 承認（P0ゼロ、P1のドキュメント鮮度指摘は同コミットで反映）
 
 ## W2: VS Code 拡張の骨格
 - 内容: `cowl serve --stdio` を child_process で spawn し、アクティブな
