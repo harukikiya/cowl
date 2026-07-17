@@ -31,7 +31,15 @@ use tree_sitter::{Node, Parser};
 // 追加時は「本当に常にそう振る舞うか」を manpage で確認し、テストを1本足すこと
 // ---------------------------------------------------------------------------
 
-/// ヒープ確保として扱う関数（戻り値が新しい所有権になる）
+/// ヒープ確保として扱う関数（戻り値が新しい所有権になる）。
+///
+/// fopen/fdopen/freopen/tmpfile/popen/opendir は本来 FILE*/DIR* であり
+/// malloc 系のヒープメモリとは別物だが、facts のスキーマは不変が
+/// W3の決定事項（AllocSource に専用 variant を足すのはL2以降の課題）なので
+/// そのまま AllocSource::Heap{func} を流用する。
+/// これに伴い「確保関数と解放関数の対応が正しいか」（例: fopen したものを
+/// fclose ではなく free してしまう誤り）の検証はL1のスコープ外とする。
+/// L1は「解放系の呼び出しがあったか」だけを見て対応関係の妥当性は問わない
 const ALLOC_FNS: &[&str] = &[
     "malloc",
     "calloc",
@@ -39,20 +47,102 @@ const ALLOC_FNS: &[&str] = &[
     "strdup",
     "strndup",
     "aligned_alloc",
+    "fopen",
+    "fdopen",
+    "freopen",
+    "tmpfile",
+    "popen",
+    "opendir",
 ];
 
-/// ポインタ引数の所有権を「消費」する関数（渡した側の解放責任が消える）。
+/// ポインタ引数の所有権を「消費」する関数の (関数名, 消費する引数位置=0始まり)。
 /// free は Free イベントとして特別扱いするのでこの表には含めない。
-/// realloc は第1引数を消費する（成功時。失敗時は残るがL1では追わない＝既知の妥協）
-const CONSUMER_FNS: &[&str] = &["fclose", "realloc"];
+///
+/// 表に載っている関数は manpage で**全引数**の意味論を確認済みという意味であり、
+/// 消費位置**以外**の引数は曖昧(None)にせず consumed:Some(false)（非消費と断定）
+/// にしてよい。realloc/freopen は「引数を消費しつつ戻り値で新しい所有権を返す」
+/// 関数なので ALLOC_FNS にも載っている（`p = realloc(p, n)` のような自己代入は
+/// 「右辺で旧pを消費→左辺で新pを獲得」という順序になる。イベント順の扱いは
+/// classify_occurrence の assignment_expression ケースのコメント参照）
+const CONSUMER_FNS: &[(&str, usize)] = &[
+    ("fclose", 0),
+    ("realloc", 0),
+    ("reallocarray", 0),
+    ("pclose", 0),
+    ("closedir", 0),
+    ("freopen", 2),
+];
 
 /// ポインタを借りるだけで消費しないことが自明な標準関数。
-/// ここに載っていない未知関数は consumed=None（曖昧）になる
+/// ここに載っていない未知関数は consumed=None（曖昧）になる。
+///
+/// strdup/strndup/fopen/fdopen/popen/opendir は ALLOC_FNS にも載っているが
+/// 矛盾ではない：ALLOC_FNS は「その関数の**戻り値**を受け取ったとき」
+/// （interp_rhs が参照）、BENIGN_FNS は「その関数へ**引数として**渡したとき」
+/// （argument_list ケースが参照）と、参照される文脈が違う。
+/// 例えば `q = strdup(p)` は q への Alloc（新しい所有権）であると同時に、
+/// p は借用のまま（strdup は p の指す内容をコピーするだけで p 自体は
+/// 消費しない）— これが現状 p を曖昧扱いにしていた穴を塞ぐ。
+/// freopen は CONSUMER_FNS（第3引数=stream を消費）に載せたのでここには含めない
 const BENIGN_FNS: &[&str] = &[
-    "printf", "fprintf", "snprintf", "sprintf", "puts", "fputs", "putchar", "perror", "strlen",
-    "strcpy", "strncpy", "strcat", "strncat", "strcmp", "strncmp", "strchr", "strstr", "memcpy",
-    "memmove", "memset", "memcmp", "fwrite", "fread", "fgets", "sscanf",
+    "printf",
+    "fprintf",
+    "snprintf",
+    "sprintf",
+    "puts",
+    "fputs",
+    "putchar",
+    "perror",
+    "strlen",
+    "strcpy",
+    "strncpy",
+    "strcat",
+    "strncat",
+    "strcmp",
+    "strncmp",
+    "strchr",
+    "strstr",
+    "memcpy",
+    "memmove",
+    "memset",
+    "memcmp",
+    "fwrite",
+    "fread",
+    "fgets",
+    "sscanf",
+    "strdup",
+    "strndup",
+    "fopen",
+    "fdopen",
+    "popen",
+    "opendir",
+    "strrchr",
+    "memchr",
+    "strcasecmp",
+    "strncasecmp",
+    "strtol",
+    "strtod",
+    "atoi",
 ];
+
+/// callee の呼び出しに対して、引数位置 arg_pos に渡した追跡ポインタが
+/// 「消費されるか」を既知関数テーブルから判定する。
+/// 判定順（呼び出し元で free は先に弾いている前提）:
+///   CONSUMER表にあり位置一致→Some(true) / 位置不一致→Some(false) /
+///   BENIGN表にあり→Some(false) / どちらにも無い未知関数→None（曖昧）
+fn consumed_for(callee: &str, arg_pos: Option<usize>) -> Option<bool> {
+    if let Some(&(_, consumer_pos)) = CONSUMER_FNS.iter().find(|(name, _)| *name == callee) {
+        // CONSUMER表にあり位置一致→消費、位置不一致→非消費と断定
+        // （表に載っている＝manpageで全引数の意味論を確認済みのため）。
+        // 位置を特定できない(None)のは理論上到達しない防御的分岐だが、
+        // 起きたら「わからない」を尊重して曖昧側に倒す
+        arg_pos.map(|p| p == consumer_pos)
+    } else if BENIGN_FNS.contains(&callee) {
+        Some(false)
+    } else {
+        None // 未知関数 = 曖昧。analysis が曖昧度に計上する
+    }
+}
 
 // ---------------------------------------------------------------------------
 // 公開API
@@ -256,8 +346,15 @@ fn extract_function(fn_node: Node, src: &str) -> Option<FunctionFacts> {
             ));
         } else if let Some(init) = p.init {
             let kind = interp_rhs(init, src, &name_to_id);
+            // ソートキーは init の開始ではなく**終端**の byte。
+            // `char *q = realloc(p, 8);` のように初期化式の中で他の追跡変数
+            // (p) を消費する呼び出しがある場合、実行順は
+            // 「右辺評価（pの消費）→ qへの束縛（獲得）」。開始byteで揃えると
+            // 獲得(Alloc)が消費(PassedTo)より前に並んでしまい、偽の
+            // overwrite_owned/leak_suspect を生む（詳細はB-1側の同種の
+            // コメント参照）。span（表示位置）は従来どおり init のまま
             evs.push((
-                init.start_byte(),
+                init.end_byte(),
                 Event {
                     var: vid,
                     span: span_of(init),
@@ -280,6 +377,18 @@ fn extract_function(fn_node: Node, src: &str) -> Option<FunctionFacts> {
             Occ::Event(kind) => {
                 evs.push((
                     id.start_byte(),
+                    Event {
+                        var: vid,
+                        span: span_of(id),
+                        kind,
+                    },
+                ));
+            }
+            Occ::EventAt(kind, sort_byte) => {
+                // ソートキーだけ呼び出し元(classify_occurrence)指定の位置に
+                // 差し替える。表示位置(span)は出現位置(id)のまま揃える
+                evs.push((
+                    sort_byte,
                     Event {
                         var: vid,
                         span: span_of(id),
@@ -334,6 +443,18 @@ enum Occ {
     /// イベント化しない（宣言名の位置・Pass Aで処理済みの初期化RHSなど）
     Skip,
     Event(EventKind),
+    /// イベント化するが、ソートキー（実行順の代理指標）を出現位置(id.start_byte())
+    /// ではなく指定の byte 位置に上書きする。
+    /// 代入 `p = <RHS>` の左辺出現がこれに該当する：構文上は左辺が右辺より
+    /// 前に出現するが、実行順は「右辺評価→代入」なので、そのまま出現順で
+    /// ソートすると `p = realloc(p, 8)` のような自己代入で
+    /// 獲得(Alloc)が消費(PassedTo)より前に並んでしまう（呼び出し元のコメント参照）。
+    ///
+    /// 【拡張時の警告】この機構は現在**同一文内**の並べ替えにのみ使っている。
+    /// 文や分岐をまたぐ順序調整に使いたくなったら、それは規約2
+    /// （制御フロー非考慮=L1の割り切り）への抵触なので、L2 のタスクとして
+    /// 起票する（レビューで必ず確認すること）
+    EventAt(EventKind, usize),
     /// イベント化しつつ unknowns にも記録（`&p` など）
     EventWithUnknown(EventKind, String),
 }
@@ -394,7 +515,18 @@ fn classify_occurrence(id: Node, src: &str, tracked: &HashMap<String, VarId>) ->
                                 mode: UseMode::Read,
                             });
                         }
-                        return Occ::Event(interp_rhs(right, src, tracked));
+                        // 実行意味論は「右辺を評価（旧資源の消費）→ 結果を代入
+                        // （新資源の獲得）」の順。だがこのイベントは左辺 id の
+                        // 出現位置で処理しており、左辺は右辺よりバイト位置が
+                        // 前にある。ソートキーをそのまま id 側に取ると
+                        // `p = realloc(p, 8)` で Alloc(realloc) が
+                        // PassedTo(realloc, consumed:true) より前に並んでしまい、
+                        // 「獲得→直後に消費」という逆順で解析され、偽の
+                        // overwrite_owned/leak_suspect を生む（実測済みのバグ）。
+                        // ソートキーだけ右辺終端(right.end_byte())に差し替えて
+                        // 実行順に一致させる。span（表示位置）は従来どおり
+                        // 左辺 id のまま＝ユーザーには `p = ` の行が表示される
+                        return Occ::EventAt(interp_rhs(right, src, tracked), right.end_byte());
                     }
                     // `*p = ...` / `p->x = ...` / `p[i] = ...` : 指す先への書き込み
                     return Occ::Event(EventKind::Use {
@@ -475,13 +607,14 @@ fn classify_occurrence(id: Node, src: &str, tracked: &HashMap<String, VarId>) ->
                 if callee == "free" {
                     return Occ::Event(EventKind::Free);
                 }
-                let consumed = if CONSUMER_FNS.contains(&callee.as_str()) {
-                    Some(true)
-                } else if BENIGN_FNS.contains(&callee.as_str()) {
-                    Some(false)
-                } else {
-                    None // 未知関数 = 曖昧。analysis が曖昧度に計上する
-                };
+                // 引数位置の特定: cast/paren は1段ずつ登る既存ループのおかげで、
+                // argument_list に到達した時点の cur は必ずその直接の named
+                // child（`(void*)p` のような cast 越しでも、cur は cast_expression
+                // ノードそのものまで登り切っている）。よって「cur と id() が
+                // 一致する named child の添字」が構文上の引数位置に一致する
+                let arg_pos = (0..par.named_child_count())
+                    .find(|&i| par.named_child(i).map(|c| c.id()) == Some(cur.id()));
+                let consumed = consumed_for(&callee, arg_pos);
                 return Occ::Event(EventKind::PassedTo { callee, consumed });
             }
             "call_expression" => {
@@ -713,6 +846,18 @@ mod tests {
             .collect()
     }
 
+    /// 1関数目の (所属変数, イベント種別) ペア列を取り出す補助。
+    /// 同名の別変数間で「どちらのイベントか」を区別したいテスト用
+    /// （引数位置ごとに consumed が変わるケースなど）
+    fn events_of(src: &str) -> Vec<(VarId, EventKind)> {
+        let f = extract_source(src, "t.c").unwrap();
+        f.functions[0]
+            .events
+            .iter()
+            .map(|e| (e.var, e.kind.clone()))
+            .collect()
+    }
+
     #[test]
     fn basic_malloc_use_free() {
         let ks = kinds_of(
@@ -866,5 +1011,295 @@ void f(void) {
             }
         );
         assert_eq!(ks[1], EventKind::Free);
+    }
+
+    // -----------------------------------------------------------------------
+    // W3: 既知関数テーブル拡充 — 表駆動テスト
+    // 「追加1関数につきテスト1本（1関数1アサーション以上）」をここで満たす
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn alloc_fns_added_are_heap_sources() {
+        // ストリーム/ディレクトリ系の追加分。戻り値代入が
+        // Alloc{Heap{当該関数}} になることを1関数ずつ確認する
+        for callee in ["fopen", "fdopen", "freopen", "tmpfile", "popen", "opendir"] {
+            let src = format!("void f(void) {{ char *x = {callee}(); }}");
+            let ks = kinds_of(&src);
+            assert_eq!(
+                ks[0],
+                EventKind::Alloc {
+                    source: AllocSource::Heap {
+                        func: callee.into()
+                    }
+                },
+                "callee={callee}"
+            );
+        }
+    }
+
+    #[test]
+    fn benign_fns_added_do_not_consume() {
+        // POSIX頻出関数の追加分。引数に渡した追跡変数が
+        // consumed:Some(false) になることを1関数ずつ確認する。
+        // strdup/fopen/fdopen/popen/opendir は ALLOC_FNS にも載っているが、
+        // ここで見ているのは「引数として渡した側」の解釈なので矛盾しない
+        for callee in [
+            "strdup",
+            "strndup",
+            "fopen",
+            "fdopen",
+            "popen",
+            "opendir",
+            "strrchr",
+            "memchr",
+            "strcasecmp",
+            "strncasecmp",
+            "strtol",
+            "strtod",
+            "atoi",
+        ] {
+            let src = format!("void f(void) {{ char *p = malloc(4); {callee}(p); free(p); }}");
+            let ks = kinds_of(&src);
+            assert_eq!(
+                ks[1],
+                EventKind::PassedTo {
+                    callee: callee.into(),
+                    consumed: Some(false)
+                },
+                "callee={callee}"
+            );
+        }
+    }
+
+    #[test]
+    fn consumer_fns_added_consume_at_declared_position() {
+        // fclose/realloc 以外に新設した CONSUMER_FNS エントリ。
+        // 表の消費位置に置いた追跡変数が Some(true) になることを確認する
+        // （reallocarray/pclose/closedirは位置0、freopenは位置2）
+        let cases: &[(&str, &str)] = &[
+            ("reallocarray", "reallocarray(p, 2, 4)"),
+            ("pclose", "pclose(p)"),
+            ("closedir", "closedir(p)"),
+            ("freopen", r#"freopen("f", "r", p)"#),
+        ];
+        for (callee, call) in cases {
+            let src = format!("void f(void) {{ char *p = malloc(4); {call}; }}");
+            let ks = kinds_of(&src);
+            assert_eq!(
+                ks[1],
+                EventKind::PassedTo {
+                    callee: (*callee).into(),
+                    consumed: Some(true)
+                },
+                "callee={callee}"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // W3: 個別テスト — 意味論が非自明なものを個別に固定する
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn realloc_first_arg_consumed_second_arg_not() {
+        // realloc(ptr, size) は位置0(ptr)だけを消費する。位置1に追跡ポインタを
+        // 置いた場合は「表にある関数の非消費位置」として Some(false) と断定する
+        // （表に無い関数のように曖昧Noneには倒さない、という規約の確認）
+        let ev = events_of(
+            "void f(void) { char *p = malloc(4); char *n = malloc(1); char *q = realloc(p, n); }",
+        );
+        assert_eq!(
+            ev[2],
+            (
+                VarId(0), // p: 消費位置
+                EventKind::PassedTo {
+                    callee: "realloc".into(),
+                    consumed: Some(true)
+                }
+            )
+        );
+        assert_eq!(
+            ev[3],
+            (
+                VarId(1), // n: 非消費位置
+                EventKind::PassedTo {
+                    callee: "realloc".into(),
+                    consumed: Some(false)
+                }
+            )
+        );
+    }
+
+    #[test]
+    fn realloc_self_assign_event_order_matches_execution_semantics() {
+        // 実測されたバグの回帰テスト。`p = realloc(p, 8);` の実行順は
+        // 「右辺評価(旧pの消費)→代入(新pの獲得)」だが、出現バイト順
+        // （構文上は左辺pが右辺より前）でそのままソートすると
+        // Alloc(realloc)がPassedTo(realloc)より前に並んでしまい、
+        // 「獲得→直後に消費」という逆順で解析され、偽の
+        // overwrite_owned/leak_suspect を生んでいた。
+        // 代入イベントのソートキーを右辺終端に上書きする修正の直接の回帰テスト
+        let ks = kinds_of(
+            r#"
+void f(void) {
+    char *p = malloc(4);
+    p = realloc(p, 8);
+    free(p);
+}
+"#,
+        );
+        assert_eq!(
+            ks,
+            vec![
+                EventKind::Alloc {
+                    source: AllocSource::Heap {
+                        func: "malloc".into()
+                    }
+                },
+                EventKind::PassedTo {
+                    callee: "realloc".into(),
+                    consumed: Some(true)
+                },
+                EventKind::Alloc {
+                    source: AllocSource::Heap {
+                        func: "realloc".into()
+                    }
+                },
+                EventKind::Free,
+            ]
+        );
+    }
+
+    #[test]
+    fn freopen_consumes_third_arg_only() {
+        // freopen(path, mode, stream) は第3引数(stream, 位置2)だけを消費する。
+        // 第1引数(path)に追跡変数を置いても、表にある関数の非消費位置として
+        // Some(false) になる（曖昧のNoneにはならない）
+        let ev = events_of(
+            r#"
+void f(void) {
+    char *path = malloc(4);
+    char *fp = malloc(8);
+    freopen(path, "r", fp);
+}
+"#,
+        );
+        assert_eq!(
+            ev[2],
+            (
+                VarId(0), // path: 非消費位置
+                EventKind::PassedTo {
+                    callee: "freopen".into(),
+                    consumed: Some(false)
+                }
+            )
+        );
+        assert_eq!(
+            ev[3],
+            (
+                VarId(1), // fp: 消費位置(2)
+                EventKind::PassedTo {
+                    callee: "freopen".into(),
+                    consumed: Some(true)
+                }
+            )
+        );
+    }
+
+    #[test]
+    fn fopen_alloc_and_argument_are_consistent() {
+        // fopen は戻り値側では Alloc{Heap{fopen}}（新しい所有権）、
+        // 引数側では BENIGN（path文字列を借用するだけ）。
+        // 同一関数が ALLOC_FNS/BENIGN_FNS の両方に載っていても、
+        // 参照される文脈（戻り値の解釈 vs 引数の解釈）が違うため
+        // 矛盾しないことを確認する
+        let ev = events_of(
+            r#"
+void f(void) {
+    char *path = malloc(4);
+    char *fp = fopen(path, "r");
+}
+"#,
+        );
+        assert_eq!(
+            ev[1],
+            (
+                VarId(0), // path
+                EventKind::PassedTo {
+                    callee: "fopen".into(),
+                    consumed: Some(false)
+                }
+            )
+        );
+        assert_eq!(
+            ev[2],
+            (
+                VarId(1), // fp
+                EventKind::Alloc {
+                    source: AllocSource::Heap {
+                        func: "fopen".into()
+                    }
+                }
+            )
+        );
+    }
+
+    #[test]
+    fn realloc_self_assign_analysis_has_no_false_positive() {
+        // W3の本丸: フロントエンドのイベント順序修正が、analysis層の誤診断
+        // （overwrite_owned/leak_suspectの偽陽性2件・カバレッジ0.0）を
+        // 実際に解消することを確認する統合テスト。
+        // analysis のロジックには一切手を入れていない —
+        // facts側が正しい実行順でイベントを出すようになった、という
+        // フロントエンド側の修正だけで解消されることの確認（cowl-core は
+        // Cargo.toml で通常依存として引いているのでテストから直接呼べる）
+        let facts = extract_source(
+            r#"
+void f(void) {
+    char *p = malloc(4);
+    p = realloc(p, 8);
+    free(p);
+}
+"#,
+            "t.c",
+        )
+        .unwrap();
+        let report = cowl_core::analysis::analyze(&facts);
+        let fr = &report.functions[0];
+        assert!(fr.issues.is_empty(), "issues: {:?}", fr.issues);
+        assert_eq!(report.metrics.ownership_coverage, 1.0);
+    }
+
+    #[test]
+    fn plain_overwrite_without_self_ref_still_flags_overwrite_owned() {
+        // 上のテストの対: realloc越しの自己代入（偽陽性→解消済み）と違い、
+        // 消費関数を介さない単純な再代入はイベント順序修正後も引き続き
+        // OverwriteOwned として検出されるべき（真陽性が誤って消えていない
+        // ことの回帰テスト。examples/leak.c の overwrite() と同じパターン）。
+        // 順序ロジック（EventAt）に再度手が入ったとき、この2本が対で
+        // 偽陽性・真陽性の両側を守る
+        let facts = extract_source(
+            "void f(void) { char *p = malloc(16); p = malloc(32); free(p); }",
+            "t.c",
+        )
+        .unwrap();
+        let report = cowl_core::analysis::analyze(&facts);
+        let fr = &report.functions[0];
+        // 単純上書きは「上書き(OverwriteOwned)」と「上書きされた旧資源の
+        // リーク(LeakSuspect)」の2件セットで出るのが仕様。ここで守りたい
+        // 真陽性は OverwriteOwned が消えないこと
+        use cowl_core::analysis::IssueKind;
+        assert!(
+            fr.issues
+                .iter()
+                .any(|i| i.kind == IssueKind::OverwriteOwned),
+            "issues: {:?}",
+            fr.issues
+        );
+        assert!(
+            fr.issues.iter().any(|i| i.kind == IssueKind::LeakSuspect),
+            "issues: {:?}",
+            fr.issues
+        );
     }
 }
