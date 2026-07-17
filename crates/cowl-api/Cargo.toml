@@ -1,0 +1,12 @@
+[package]
+name = "cowl-api"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+cowl-core = { path = "../cowl-core" }
+cowl-front-ts = { path = "../cowl-front-ts" }
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true

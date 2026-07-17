@@ -1,0 +1,15 @@
+[package]
+name = "cowl-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "cowl"
+path = "src/main.rs"
+
+[dependencies]
+cowl-api = { path = "../cowl-api" }
+clap.workspace = true
+anyhow.workspace = true
+serde_json.workspace = true

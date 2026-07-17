@@ -1,0 +1,11 @@
+[package]
+name = "cowl-front-ts"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+cowl-core = { path = "../cowl-core" }
+tree-sitter.workspace = true
+tree-sitter-c.workspace = true
+anyhow.workspace = true

@@ -1,0 +1,285 @@
+//! # render_html — ライフタイム帯の可視化（単一HTML）
+//!
+//! 出力は **依存ゼロの自己完結HTML** 1ファイル。CDNもビルドも不要で、
+//! ブラウザで開くだけ・チャットに貼るだけで見られることを最優先にする
+//! （pbacid_lab.html などと同じ思想）。
+//!
+//! ## レイアウト戦略
+//! SVGで絶対座標を計算する案もあったが、**HTMLテーブル**を選んだ。
+//! 理由: 行 = ソース行、列 = 変数、という構造がテーブルと同型で、
+//! 座標計算・フォントメトリクス依存・折返し問題が全部消える。
+//! セルの背景色がそのまま「ライフタイム帯」になる。
+//!
+//! ## 色の意味（凡例と厳密に一致させること）
+//! Phase と色は1対1。新しいPhaseを足すワーカーは必ずここと
+//! `phase_class`/CSS/凡例の3点を同時に更新する。
+
+use crate::analysis::*;
+use crate::facts::Facts;
+use std::collections::BTreeMap;
+use std::fmt::Write;
+
+/// HTMLエスケープ。ソースコードをそのまま埋め込むので必須
+fn esc(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
+/// Phase → CSSクラス名。色定義は下のCSSにある
+fn phase_class(p: Phase) -> &'static str {
+    match p {
+        Phase::Uninit => "ph-uninit",
+        Phase::Null => "ph-null",
+        Phase::Owned => "ph-owned",
+        Phase::Alias => "ph-alias",
+        Phase::Borrowed => "ph-borrow",
+        Phase::Dangling => "ph-dangling",
+        Phase::Moved => "ph-moved",
+        Phase::Escaped => "ph-escaped",
+        Phase::OpaqueVal => "ph-opaque",
+    }
+}
+
+fn mark_glyph(k: MarkKind) -> &'static str {
+    match k {
+        MarkKind::Alloc => "●",  // 確保
+        MarkKind::Free => "✕",   // 解放
+        MarkKind::Use => "·",    // 使用（控えめに）
+        MarkKind::Move => "➤",   // ムーブ
+        MarkKind::Escape => "↗", // 脱出
+        MarkKind::Issue => "⚠",  // 問題
+    }
+}
+
+/// facts（ソース原文のため）と report（解析結果）からHTML全文を生成する
+pub fn render_html(facts: &Facts, report: &Report) -> String {
+    let mut h = String::with_capacity(64 * 1024);
+    // --- ヘッダ・CSS・凡例 ---------------------------------------------------
+    // CSSカスタムプロパティで色を一元管理（teal=所有 / indigo=別名・借用 /
+    // coral=危険、というプロジェクト共通のデザイントークン）
+    let _ = write!(
+        h,
+        r#"<!doctype html>
+<html lang="ja"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>cowl report — {file}</title>
+<style>
+:root {{
+  --owned:#99f6e4; --owned-b:#0d9488;   /* teal   : 所有 */
+  --alias:#c7d2fe; --alias-b:#6366f1;   /* indigo : 別名 */
+  --borrow:#e0e7ff;                      /* indigo淡: 借用 */
+  --danger:#fecaca; --danger-b:#ef4444; /* coral  : 危険 */
+  --moved:#ddd6fe; --escaped:#fde68a; --null:#e5e7eb; --opaque:#e7e5e4;
+  --ink:#1c1917; --sub:#78716c; --line:#e7e5e4; --bg:#fafaf9;
+}}
+* {{ box-sizing:border-box; }}
+body {{ margin:0; padding:24px; background:var(--bg); color:var(--ink);
+  font-family:"Hiragino Sans","Noto Sans JP",system-ui,sans-serif; }}
+h1 {{ font-size:20px; margin:0 0 4px; }}
+h2 {{ font-size:16px; margin:32px 0 8px; }}
+.sub {{ color:var(--sub); font-size:12px; }}
+.cards {{ display:flex; gap:12px; flex-wrap:wrap; margin:16px 0; }}
+.card {{ background:#fff; border:1px solid var(--line); border-radius:10px;
+  padding:10px 16px; min-width:130px; }}
+.card .k {{ font-size:11px; color:var(--sub); }}
+.card .v {{ font-size:22px; font-weight:700; }}
+.card.warn .v {{ color:var(--danger-b); }}
+table {{ border-collapse:collapse; background:#fff; border:1px solid var(--line);
+  border-radius:8px; overflow:hidden; }}
+th,td {{ border-bottom:1px solid var(--line); font-size:12px; }}
+th {{ background:#f5f5f4; padding:4px 8px; position:sticky; top:0; }}
+td.ln {{ color:var(--sub); text-align:right; padding:0 8px; user-select:none;
+  font-family:ui-monospace,Menlo,Consolas,monospace; }}
+td.code {{ font-family:ui-monospace,Menlo,Consolas,monospace; white-space:pre;
+  padding:0 12px; min-width:320px; }}
+tr.hasissue td.code {{ background:#fff1f0; }}
+td.cell {{ width:64px; min-width:64px; text-align:center;
+  font-family:ui-monospace,monospace; cursor:default; }}
+/* 帯の本体：フェーズ色。左ボーダーで帯の輪郭を出す */
+.ph-owned   {{ background:var(--owned);   border-left:3px solid var(--owned-b); }}
+.ph-alias   {{ background:var(--alias);   border-left:3px solid var(--alias-b); }}
+.ph-borrow  {{ background:var(--borrow);  border-left:3px solid var(--alias-b); }}
+.ph-dangling{{ background:var(--danger);  border-left:3px solid var(--danger-b); }}
+.ph-moved   {{ background:var(--moved); }}
+.ph-escaped {{ background:var(--escaped); }}
+.ph-null    {{ background:var(--null); }}
+.ph-opaque  {{ background:var(--opaque); }}
+.ph-uninit  {{ background:transparent; }}
+td.cell.hl {{ outline:2px solid var(--ink); outline-offset:-2px; }}
+.issues li {{ font-size:13px; margin:4px 0; }}
+.issues .tag {{ display:inline-block; background:var(--danger);
+  color:#7f1d1d; border-radius:4px; padding:0 6px; font-size:11px; margin-right:6px; }}
+.unknowns li {{ font-size:12px; color:var(--sub); }}
+.legend {{ display:flex; gap:10px; flex-wrap:wrap; margin:8px 0 16px; font-size:12px; }}
+.legend span {{ display:inline-flex; align-items:center; gap:4px; }}
+.sw {{ width:14px; height:14px; border-radius:3px; display:inline-block;
+  border:1px solid var(--line); }}
+footer {{ margin-top:32px; font-size:11px; color:var(--sub); }}
+</style></head><body>
+<h1>cowl — 所有権・ライフタイム可視化</h1>
+<div class="sub">{file} ｜ facts {fv} / report {rv} ｜ L1（構文近似）解析：制御フローは未考慮</div>
+"#,
+        file = esc(&report.file),
+        fv = esc(&facts.schema_version),
+        rv = esc(&report.schema_version),
+    );
+
+    // ファイル全体の指標カード
+    write_metric_cards(&mut h, &report.metrics);
+
+    // 凡例（Phase の意味を利用者へ）
+    h.push_str(
+        r#"<div class="legend">
+<span><i class="sw" style="background:var(--owned)"></i>所有(Owned)</span>
+<span><i class="sw" style="background:var(--alias)"></i>別名(Alias)</span>
+<span><i class="sw" style="background:var(--borrow)"></i>借用(&amp;x)</span>
+<span><i class="sw" style="background:var(--danger)"></i>ダングリング</span>
+<span><i class="sw" style="background:var(--moved)"></i>ムーブ済</span>
+<span><i class="sw" style="background:var(--escaped)"></i>脱出(return/store)</span>
+<span><i class="sw" style="background:var(--null)"></i>NULL</span>
+<span><i class="sw" style="background:var(--opaque)"></i>追跡不能</span>
+<span>● 確保 ✕ 解放 · 使用 ➤ ムーブ ↗ 脱出 ⚠ 問題</span>
+</div>
+"#,
+    );
+
+    // --- 関数ごとの本体 -------------------------------------------------------
+    for func in &report.functions {
+        let _ = writeln!(h, "<h2>関数 <code>{}</code></h2>", esc(&func.name));
+        write_metric_cards(&mut h, &func.metrics);
+
+        // 行→(フェーズ, マーク列) を変数ごとに引けるよう前計算しておく。
+        // segments は昇順・非重複なのでBTreeMapに展開するだけでよい
+        let mut phase_at: Vec<BTreeMap<u32, Phase>> = Vec::new();
+        let mut marks_at: Vec<BTreeMap<u32, Vec<&Mark>>> = Vec::new();
+        for v in &func.vars {
+            let mut pm = BTreeMap::new();
+            for s in &v.segments {
+                for l in s.from_line..=s.to_line {
+                    pm.insert(l, s.phase);
+                }
+            }
+            let mut mm: BTreeMap<u32, Vec<&Mark>> = BTreeMap::new();
+            for m in &v.marks {
+                mm.entry(m.line).or_default().push(m);
+            }
+            phase_at.push(pm);
+            marks_at.push(mm);
+        }
+        // Issueのある行をコード側でも薄く塗るための集合
+        let issue_lines: std::collections::BTreeSet<u32> =
+            func.issues.iter().map(|i| i.line).collect();
+
+        h.push_str("<table><thead><tr><th>行</th><th style=\"text-align:left\">コード</th>");
+        for v in &func.vars {
+            let _ = write!(h, "<th class=\"vh\">{}</th>", esc(&v.name));
+        }
+        h.push_str("</tr></thead><tbody>\n");
+
+        for line in func.span.line_start..=func.span.line_end {
+            let cls = if issue_lines.contains(&line) {
+                " class=\"hasissue\""
+            } else {
+                ""
+            };
+            let _ = write!(
+                h,
+                "<tr{}><td class=\"ln\">{}</td><td class=\"code\">{}</td>",
+                cls,
+                line,
+                esc(facts.line_text(line)),
+            );
+            for (vi, _) in func.vars.iter().enumerate() {
+                let phase = phase_at[vi].get(&line).copied().unwrap_or(Phase::Uninit);
+                let (glyphs, title) = match marks_at[vi].get(&line) {
+                    Some(ms) => {
+                        let g: String = ms.iter().map(|m| mark_glyph(m.kind)).collect();
+                        let t: Vec<String> = ms.iter().map(|m| m.note.clone()).collect();
+                        (g, t.join(" / "))
+                    }
+                    None => (String::new(), String::new()),
+                };
+                // data-col でJSの列ハイライトを可能にする
+                let _ = write!(
+                    h,
+                    "<td class=\"cell {} \" data-col=\"{}\" title=\"{}\">{}</td>",
+                    phase_class(phase),
+                    vi,
+                    esc(&title),
+                    glyphs,
+                );
+            }
+            h.push_str("</tr>\n");
+        }
+        h.push_str("</tbody></table>\n");
+
+        // 診断リスト
+        if !func.issues.is_empty() {
+            h.push_str("<ul class=\"issues\">\n");
+            for is in &func.issues {
+                let _ = writeln!(
+                    h,
+                    "<li><span class=\"tag\">{:?}</span>L{} <code>{}</code>: {}</li>",
+                    is.kind,
+                    is.line,
+                    esc(&is.var),
+                    esc(&is.message),
+                );
+            }
+            h.push_str("</ul>\n");
+        }
+        // 「わからなかった」も隠さず表示する（信頼度の材料）
+        if !func.unknowns.is_empty() {
+            h.push_str("<details><summary class=\"sub\">解析器が追跡できなかった箇所</summary><ul class=\"unknowns\">\n");
+            for u in &func.unknowns {
+                let _ = writeln!(h, "<li>L{}: {}</li>", u.span.line_start, esc(&u.reason));
+            }
+            h.push_str("</ul></details>\n");
+        }
+    }
+
+    // --- 最小限のJS: 同一変数列のホバー強調（依存ゼロ） -----------------------
+    h.push_str(
+        r#"<script>
+// マウスが乗った列（=変数）の全セルを縁取りして、帯を目で追いやすくする。
+// テーブルごとに data-col が振り直されるので、同じテーブル内だけを対象にする
+document.addEventListener('mouseover', (e) => {
+  const td = e.target.closest('td.cell');
+  document.querySelectorAll('td.cell.hl').forEach(x => x.classList.remove('hl'));
+  if (!td) return;
+  const col = td.dataset.col;
+  const table = td.closest('table');
+  table.querySelectorAll(`td.cell[data-col="${col}"]`).forEach(x => x.classList.add('hl'));
+});
+</script>
+<footer>generated by cowl（L1構文近似。分岐・ループの制御フローは考慮していません。
+「追跡不能」「曖昧」はL2/libclang・L3/LLM補助で解消予定の箇所です）</footer>
+</body></html>
+"#,
+    );
+    h
+}
+
+/// 指標カード群（ファイル/関数で共用）
+fn write_metric_cards(h: &mut String, m: &Metrics) {
+    let warn_amb = if m.ambiguity_rate > 0.0 { " warn" } else { "" };
+    let warn_iss = if m.issues_total > 0 { " warn" } else { "" };
+    let _ = write!(
+        h,
+        r#"<div class="cards">
+<div class="card"><div class="k">所有権カバレッジ</div><div class="v">{:.0}%</div></div>
+<div class="card{}"><div class="k">所有権曖昧度</div><div class="v">{:.0}%</div></div>
+<div class="card"><div class="k">確保サイト</div><div class="v">{}</div></div>
+<div class="card{}"><div class="k">診断</div><div class="v">{}</div></div>
+</div>
+"#,
+        m.ownership_coverage * 100.0,
+        warn_amb,
+        m.ambiguity_rate * 100.0,
+        m.sites_total,
+        warn_iss,
+        m.issues_total,
+    );
+}

@@ -1,0 +1,44 @@
+# =============================================================================
+# cowl — C OWnership & Lifetime visualizer
+#
+# ワークスペース構成（依存の向きは一方向のDAG）:
+#
+#   cowl-cli ──► cowl-api ──► cowl-front-ts ──► cowl-core
+#                                └──────────────────┘
+#
+#   * cowl-core     : 事実IR(facts) + 解析(analysis) + 描画(render)。外界を知らない純粋層
+#   * cowl-front-ts : tree-sitter によるL1フロントエンド。「Cソース → facts」変換のみ担当
+#   * cowl-api      : JSON in/out の安定API。CLI/MCP/VSCode拡張はすべてここだけを叩く
+#   * cowl-cli      : clapベースの薄いシェル
+#
+# なぜこの分割か:
+#   - フロントエンドは将来 libclang 版(L2)に差し替える計画があるため、
+#     重い依存(tree-sitter)を独立クレートに隔離しておく
+#   - MCPサーバやVSCode拡張を作るとき、cowl-api の JSON契約だけ見れば
+#     済むようにする（コア内部型に外部を依存させない）
+# =============================================================================
+[workspace]
+resolver = "2"
+members = [
+    "crates/cowl-core",
+    "crates/cowl-front-ts",
+    "crates/cowl-api",
+    "crates/cowl-cli",
+]
+
+# バージョンや依存はワークスペースで一元管理する。
+# ワーカー(下位モデル)が個別クレートに勝手なバージョンを足して
+# 依存がねじれる事故を防ぐ狙いもある（CLAUDE.md の規約とセット）。
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+thiserror = "2"
+tree-sitter = "0.25"
+tree-sitter-c = "0.24"
+clap = { version = "4", features = ["derive"] }
