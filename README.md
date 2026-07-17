@@ -37,7 +37,7 @@ cowl-mcp ──┘
 
 - 詳細な規約とレイヤ責務: **CLAUDE.md**（プロジェクト憲法）
 - 設計判断: docs/adr/
-- 今後のタスク: ROADMAP.md（W2: VSCode拡張, W3: L1精度向上, W5: libclang L2 …）
+- 今後のタスク: ROADMAP.md（W3: L1精度向上, W4: 指標第2陣, W5: libclang L2 …）
 
 ## 何が見えるか（examples/demo.c）
 

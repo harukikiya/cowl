@@ -17,12 +17,17 @@
   3ツールの tools/call とエラー系（isError:true）を確認。analysis-worker
   実装＋qa-reviewer 承認（P0ゼロ、P1のドキュメント鮮度指摘は同コミットで反映）
 
-## W2: VS Code 拡張の骨格
+## W2: VS Code 拡張の骨格 [x]
 - 内容: `cowl serve --stdio` を child_process で spawn し、アクティブな
   Cファイルのライフタイム帯HTMLを Webview に表示するだけの最小拡張
 - 受け入れ: 拡張から demo.c のレポートが表示される / 編集中バッファを
   source で送るパスが通っている（保存不要で更新）
 - 備考: HTML は自己完結なので Webview にそのまま流せばよい
+- [x] 完了 (2026-07-17): 0e108cb — editors/vscode 新設（ADR-0005）。
+  受け入れ条件のうち source 送信パスは実バイナリ統合テスト8本で自動化
+  （make check-vscode）。Webview 表示はコンテナに X が無く E2E 不可のため、
+  demo.c 実バッファでのデータパス確認＋手動手順（editors/vscode/README.md）
+  で受け入れ。claude ワーカー実装＋qa-reviewer（P0ゼロ、P1 3点反映済み）
 
 ## W3: L1 精度向上（表の拡充と小さな穴埋め）
 - 内容: BENIGN_FNS / CONSUMER_FNS の拡充（POSIX頻出分）、

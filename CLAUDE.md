@@ -20,6 +20,7 @@ cowl-mcp ──┘    │              │                ├─ facts       事
 | cowl-api | Request/Response の写像 | 解析ロジックの実装 |
 | cowl-cli | 引数→Request の写像 | ロジック全般 |
 | cowl-mcp | MCPツール→Request の写像（rmcp。ADR-0004） | ロジック全般・エンベロープの再解釈 |
+| editors/vscode | serve --stdio を spawn し source を送る（ADR-0005） | ロジック全般・契約の再解釈 |
 
 ## コマンド
 
@@ -30,6 +31,7 @@ make demo      # examples/ → out/*.html, out/*.dot を再生成
 cargo run -p cowl-cli -- report examples/demo.c -o out/demo.html
 echo '{"cmd":"version"}' | cargo run -q -p cowl-cli -- serve --stdio   # JSON API手打ち
 cargo run -p cowl-mcp   # MCPサーバ(stdio)。検証: npx @modelcontextprotocol/inspector --cli target/debug/cowl-mcp --method tools/list
+make check-vscode       # VSCode拡張のビルド+テスト（node必須。Rustワーカーの完了条件には含めない）
 ```
 
 ## 絶対規約（違反はマージ不可）
