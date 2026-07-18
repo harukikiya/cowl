@@ -42,11 +42,16 @@
   同一文内に限定、規約2に不抵触なことを qa が独立検証）。既存 examples
   の出力はバイト一致で回帰なし。frontend-worker 実装＋qa-reviewer 承認
 
-## W4: 指標の第2陣
+## W4: 指標の第2陣 [x]
 - 内容: Free-Site Multiplicity / Live-Range Length / Transfer Density を
   Metrics に追加（.claude/skills/add-metric の手順厳守）
 - 担当: analysis-worker ＋ render-worker（カード表示）＋ qa-reviewer
 - 受け入れ: 指標ごとにテスト2本以上（ゼロ件ケース含む）/ demo.html に表示
+- [x] 完了 (2026-07-18): 5add6b7 — report スキーマ 0.2.0。L1 操作化の定義は
+  ADR-0006（分岐前提の原定義を「L1でどう測るか」に固定。L2以降は操作化のみ
+  精密化）。qa が P0 を1件検出（transfers_total が回数でなく Site 数を計上）
+  → 修正・回帰テスト化。warn は multiplicity>1.0 のみ（根拠なき閾値は
+  付けない）。demo.c 実測: 多重度1.25(warn) / 生存3.0行 / 移譲31.2/KLOC
 
 ## W5: L2 フロントエンド（libclang）
 - 内容: crates/cowl-front-clang/ 新設。clang-sys/clang クレートで
