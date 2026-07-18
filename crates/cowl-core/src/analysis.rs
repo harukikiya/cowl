@@ -23,14 +23,15 @@
 
 use crate::facts::*;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 // ---------------------------------------------------------------------------
 // 出力型（レポート）— これがそのまま JSON / 描画層の入力になる
 // ---------------------------------------------------------------------------
 
 /// 解析レポートのスキーマバージョン（factsとは独立に進化する）
-pub const REPORT_SCHEMA_VERSION: &str = "0.1.0";
+/// 0.2.0: Free-Site Multiplicity、Live-Range Length、Transfer Density の3指標を追加（フィールド追加のみ）
+pub const REPORT_SCHEMA_VERSION: &str = "0.2.0";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Report {
@@ -160,6 +161,42 @@ pub struct Metrics {
     pub issues_total: u32,
     /// 種類別の件数（表示・集計用）。BTreeMapなのはJSON出力を安定させるため
     pub issues_by_kind: BTreeMap<String, u32>,
+
+    // --- 指標第2陣（ADR-0006）---
+    /// **Free-Site Multiplicity** (解放サイト多重度)
+    /// 意図: 1つの資源が複数の箇所で解放されうる構造は脆い
+    /// 分母分子: free_sites_total / sites_freed
+    /// 分母0のとき: 1.0 （理想値。解放なし=多重解放なし）
+    /// 相関仮説: 1.0超は double free 混入率・リファクタ時の解放漏れと相関するはず
+    pub sites_freed: u32,
+    /// 1回以上解放された Site ごとの「相異なる解放行」の合計
+    pub free_sites_total: u32,
+    /// 解放行が2つ以上ある Site 数
+    pub sites_multi_free: u32,
+    /// free_sites_total / sites_freed（分母0のとき1.0）
+    pub free_site_multiplicity: f64,
+
+    /// **Live-Range Length** (生存区間長)
+    /// 意図: 確保から最終接触までが長いほど、レビューで追う距離が長く
+    ///       管理ミス（解放漏れ・二重解放）が混入しやすい
+    /// 分母分子: live_range_lines_total / sites_total
+    /// 分母0のとき: 0.0 （ヒープなし）
+    /// 相関仮説: 平均生存行数はリーク・UAF の混入率と正の相関を持つはず
+    pub live_range_lines_total: u32,
+    /// 全 Site の平均生存行数（live_range_lines_total / sites_total）
+    pub live_range_avg: f64,
+
+    /// **Transfer Density** (移譲密度)
+    /// 意図: 関数境界をまたぐ所有権移譲が多いほど、呼び出し規約という
+    ///       暗黙知への依存が増え、誤解によるリーク/二重解放が出やすい
+    /// 分母分子: transfers_total / (lines_analyzed / 1000)
+    /// 分母0のとき: 0.0 （解析対象行なし）
+    /// 相関仮説: 高密度のファイルほど所有権の所在の文書化が必要になるはず
+    pub transfers_total: u32,
+    /// 解析対象行数（各関数 span の line_end - line_start + 1 の合計）
+    pub lines_analyzed: u32,
+    /// transfers_total / (lines_analyzed / 1000)（分母0のとき0.0）
+    pub transfer_density: f64,
 }
 
 impl Metrics {
@@ -178,6 +215,30 @@ impl Metrics {
         } else {
             self.sites_ambiguous as f64 / t
         };
+
+        // Free-Site Multiplicity: free_sites_total / sites_freed
+        // 分母0のとき 1.0（理想値）
+        self.free_site_multiplicity = if self.sites_freed == 0 {
+            1.0
+        } else {
+            self.free_sites_total as f64 / self.sites_freed as f64
+        };
+
+        // Live-Range Length: live_range_lines_total / sites_total
+        // 分母0のとき 0.0（ヒープなし）
+        self.live_range_avg = if self.sites_total == 0 {
+            0.0
+        } else {
+            self.live_range_lines_total as f64 / self.sites_total as f64
+        };
+
+        // Transfer Density: transfers_total / (lines_analyzed / 1000)
+        // 分母0のとき 0.0（解析対象行なし）
+        self.transfer_density = if self.lines_analyzed == 0 {
+            0.0
+        } else {
+            self.transfers_total as f64 / (self.lines_analyzed as f64 / 1000.0)
+        };
     }
     fn absorb(&mut self, other: &Metrics) {
         self.sites_total += other.sites_total;
@@ -187,6 +248,13 @@ impl Metrics {
         for (k, v) in &other.issues_by_kind {
             *self.issues_by_kind.entry(k.clone()).or_insert(0) += v;
         }
+        // 指標第2陣の集計：カウンタを単純加算
+        self.sites_freed += other.sites_freed;
+        self.free_sites_total += other.free_sites_total;
+        self.sites_multi_free += other.sites_multi_free;
+        self.live_range_lines_total += other.live_range_lines_total;
+        self.transfers_total += other.transfers_total;
+        self.lines_analyzed += other.lines_analyzed;
     }
 }
 
@@ -284,6 +352,19 @@ struct SiteState {
     ambiguous: bool,
     alloc_line: u32,
     alloc_func: String,
+
+    // --- 指標計上用 ---
+    /// 相異なる解放行の集合（Free イベントか consumed:Some(true) な PassedTo の行）
+    /// 同一行での複数回解放は1行と数える
+    free_lines: BTreeSet<u32>,
+    /// Site に関わる最後のイベント行（指標「生存区間」の終点）
+    /// Free / Moved / Escaped / Use のいずれかの最大行
+    last_event_line: u32,
+    /// Moved / Escaped へ遷移した回数（同一 Site が複数回遷移することを想定）
+    /// L1 では同じ Site への代入がない場合、最後の遷移で確定するが、
+    /// 複数回遷移のケース（同じポインタが2箇所で return される等）も存在するため
+    /// 回数をカウント。これは「移譲の複雑さ」を測る指標値
+    transfer_count: u32,
 }
 
 /// 解析エントリポイント：facts 全体 → Report
@@ -440,6 +521,9 @@ fn analyze_function(f: &FunctionFacts) -> FunctionReport {
                             ambiguous: false,
                             alloc_line: line,
                             alloc_func: func.clone(),
+                            free_lines: BTreeSet::new(),
+                            last_event_line: line,
+                            transfer_count: 0,
                         });
                         bindings[vi] = Binding::Site {
                             site: sid,
@@ -525,6 +609,7 @@ fn analyze_function(f: &FunctionFacts) -> FunctionReport {
 
             EventKind::Use { .. } => {
                 if let Binding::Site { site, .. } = bindings[vi] {
+                    sites[site.0 as usize].last_event_line = line;
                     if let SiteLife::Freed { line: fl } = sites[site.0 as usize].life {
                         push_issue!(
                             IssueKind::UseAfterFree,
@@ -564,6 +649,10 @@ fn analyze_function(f: &FunctionFacts) -> FunctionReport {
                 match bindings[vi] {
                     Binding::Site { site, .. } => {
                         let ss = &mut sites[site.0 as usize];
+                        // 指標「Free-Site Multiplicity」用：解放行を記録
+                        ss.free_lines.insert(line);
+                        // 指標「Live-Range Length」用：最後のイベント行を更新
+                        ss.last_event_line = line;
                         match ss.life {
                             SiteLife::Live => {
                                 ss.life = SiteLife::Freed { line };
@@ -644,7 +733,14 @@ fn analyze_function(f: &FunctionFacts) -> FunctionReport {
                 Some(true) => {
                     // 既知の消費関数：所有権が移り、以後この関数の責任ではない
                     if let Binding::Site { site, .. } = bindings[vi] {
-                        sites[site.0 as usize].life = SiteLife::Moved;
+                        let ss = &mut sites[site.0 as usize];
+                        ss.life = SiteLife::Moved;
+                        // 指標「Free-Site Multiplicity」用：消費=解放と扱う
+                        ss.free_lines.insert(line);
+                        // 指標「Transfer Density」用：遷移回数をカウント
+                        ss.transfer_count += 1;
+                        // 指標「Live-Range Length」用：最後のイベント行を更新
+                        ss.last_event_line = line;
                         graph.edges.push(GEdge {
                             from: format!("v{}", vi),
                             to: "outside".into(),
@@ -661,7 +757,10 @@ fn analyze_function(f: &FunctionFacts) -> FunctionReport {
                 Some(false) => {
                     // 既知の非消費関数：ただの使用として扱う（UAF検査だけ効かせる）
                     if let Binding::Site { site, .. } = bindings[vi] {
-                        if let SiteLife::Freed { line: fl } = sites[site.0 as usize].life {
+                        let ss = &mut sites[site.0 as usize];
+                        // 指標「Live-Range Length」用：最後のイベント行を更新
+                        ss.last_event_line = line;
+                        if let SiteLife::Freed { line: fl } = ss.life {
                             push_issue!(
                                 IssueKind::UseAfterFree,
                                 line,
@@ -682,7 +781,10 @@ fn analyze_function(f: &FunctionFacts) -> FunctionReport {
                     // 後段の free が double free になるが、それは検出できない）。
                     // 曖昧マークだけ確実に立て、指標とレポートに現れるようにする
                     if let Binding::Site { site, .. } = bindings[vi] {
-                        sites[site.0 as usize].ambiguous = true;
+                        let ss = &mut sites[site.0 as usize];
+                        ss.ambiguous = true;
+                        // 指標「Live-Range Length」用：最後のイベント行を更新
+                        ss.last_event_line = line;
                     }
                     marks[vi].push(Mark {
                         line,
@@ -694,7 +796,12 @@ fn analyze_function(f: &FunctionFacts) -> FunctionReport {
 
             EventKind::EscapeReturn => {
                 if let Binding::Site { site, .. } = bindings[vi] {
-                    sites[site.0 as usize].life = SiteLife::Escaped;
+                    let ss = &mut sites[site.0 as usize];
+                    ss.life = SiteLife::Escaped;
+                    // 指標「Transfer Density」用：遷移回数をカウント
+                    ss.transfer_count += 1;
+                    // 指標「Live-Range Length」用：最後のイベント行を更新
+                    ss.last_event_line = line;
                     graph.edges.push(GEdge {
                         from: format!("v{}", vi),
                         to: "outside".into(),
@@ -711,10 +818,15 @@ fn analyze_function(f: &FunctionFacts) -> FunctionReport {
 
             EventKind::EscapeStore { target } => {
                 if let Binding::Site { site, .. } = bindings[vi] {
-                    sites[site.0 as usize].life = SiteLife::Escaped;
+                    let ss = &mut sites[site.0 as usize];
+                    ss.life = SiteLife::Escaped;
                     // 外部格納は return と違い、格納先経由で free される「かも」
                     // しれない。追い切れてはいないので曖昧も同時に立てる
-                    sites[site.0 as usize].ambiguous = true;
+                    ss.ambiguous = true;
+                    // 指標「Transfer Density」用：遷移回数をカウント
+                    ss.transfer_count += 1;
+                    // 指標「Live-Range Length」用：最後のイベント行を更新
+                    ss.last_event_line = line;
                     graph.edges.push(GEdge {
                         from: format!("v{}", vi),
                         to: "outside".into(),
@@ -784,12 +896,36 @@ fn analyze_function(f: &FunctionFacts) -> FunctionReport {
         if terminal && !ss.ambiguous {
             metrics.sites_resolved += 1;
         }
+
+        // 指標第2陣の計上：Free-Site Multiplicity
+        if !ss.free_lines.is_empty() {
+            metrics.sites_freed += 1;
+            metrics.free_sites_total += ss.free_lines.len() as u32;
+            if ss.free_lines.len() >= 2 {
+                metrics.sites_multi_free += 1;
+            }
+        }
+
+        // 指標第2陣の計上：Live-Range Length
+        // Site に関わるイベントが存在する場合のみ生存区間をカウント
+        // （初期値 last_event_line = alloc_line なので、alloc のみの場合は 1 になる）
+        // 異常な facts で last_event_line < alloc_line の場合も対応（saturating_sub）
+        let range = ss.last_event_line.saturating_sub(ss.alloc_line) + 1;
+        metrics.live_range_lines_total += range;
+
+        // 指標第2陣の計上：Transfer Density
+        // Site ごとの遷移回数（複数回遷移の可能性も考慮）
+        metrics.transfers_total += ss.transfer_count;
     }
     metrics.issues_total = issues.len() as u32;
     for is in &issues {
         let key = format!("{:?}", is.kind);
         *metrics.issues_by_kind.entry(key).or_insert(0) += 1;
     }
+
+    // 関数の解析対象行数を記録（Transfer Density の分母）
+    metrics.lines_analyzed = f.span.line_end - f.span.line_start + 1;
+
     metrics.finalize();
 
     FunctionReport {
@@ -1054,5 +1190,389 @@ mod tests {
         );
         let r = analyze(&f);
         assert!(kinds(&r).contains(&IssueKind::OverwriteOwned));
+    }
+
+    // --- 指標第2陣のテスト（ADR-0006） ---
+
+    #[test]
+    fn free_site_multiplicity_single_free() {
+        // malloc→free 1回 → sites_freed=1, free_sites_total=1, multiplicity=1.0
+        let f = func(&["p"], vec![(0, 3, heap()), (0, 5, EventKind::Free)], 6);
+        let r = analyze(&f);
+        let m = &r.functions[0].metrics;
+        assert_eq!(m.sites_freed, 1);
+        assert_eq!(m.free_sites_total, 1);
+        assert_eq!(m.sites_multi_free, 0);
+        assert_eq!(m.free_site_multiplicity, 1.0);
+    }
+
+    #[test]
+    fn free_site_multiplicity_double_free() {
+        // double free（同じ Site を2行で解放）→ free_sites_total=2, sites_multi_free=1
+        let f = func(
+            &["p"],
+            vec![
+                (0, 3, heap()),
+                (0, 5, EventKind::Free),
+                (0, 7, EventKind::Free), // 同一 Site の2度目の解放
+            ],
+            8,
+        );
+        let r = analyze(&f);
+        let m = &r.functions[0].metrics;
+        assert_eq!(m.sites_freed, 1);
+        assert_eq!(m.free_sites_total, 2, "同じ Site を2行で解放");
+        assert_eq!(m.sites_multi_free, 1, "Site の解放行が複数");
+        assert_eq!(m.free_site_multiplicity, 2.0);
+    }
+
+    #[test]
+    fn free_site_multiplicity_no_heap_returns_ideal() {
+        // ヒープなし関数 → sites_freed=0, multiplicity=1.0（分母0の値）
+        let f = func(&["p"], vec![], 10);
+        let r = analyze(&f);
+        let m = &r.functions[0].metrics;
+        assert_eq!(m.sites_freed, 0);
+        assert_eq!(m.sites_total, 0);
+        // 分母0のとき 1.0
+        assert_eq!(m.free_site_multiplicity, 1.0);
+    }
+
+    #[test]
+    fn live_range_length_simple() {
+        // 確保行3 → 最後のイベント行5 → 範囲 5-3+1=3
+        let f = func(
+            &["p"],
+            vec![
+                (0, 3, heap()),
+                (
+                    0,
+                    4,
+                    EventKind::Use {
+                        mode: UseMode::Write,
+                    },
+                ),
+                (0, 5, EventKind::Free),
+            ],
+            6,
+        );
+        let r = analyze(&f);
+        let m = &r.functions[0].metrics;
+        // 1つの Site: alloc_line=3, last_event_line=5
+        // 生存区間 = 5 - 3 + 1 = 3
+        assert_eq!(m.live_range_lines_total, 3);
+        assert_eq!(m.sites_total, 1);
+        assert_eq!(m.live_range_avg, 3.0);
+    }
+
+    #[test]
+    fn live_range_length_multiple_sites() {
+        // 複数の Site の生存区間の合計
+        // p: L3確保 → L5解放 (範囲 3)
+        // q: L4確保 → L6解放 (範囲 3)
+        let f = func(
+            &["p", "q"],
+            vec![
+                (0, 3, heap()),
+                (1, 4, heap()),
+                (0, 5, EventKind::Free),
+                (1, 6, EventKind::Free),
+            ],
+            7,
+        );
+        let r = analyze(&f);
+        let m = &r.functions[0].metrics;
+        // sites_total=2, live_range_lines_total = 3 + 3 = 6, avg = 3.0
+        assert_eq!(m.sites_total, 2);
+        assert_eq!(m.live_range_lines_total, 6);
+        assert_eq!(m.live_range_avg, 3.0);
+    }
+
+    #[test]
+    fn live_range_length_no_heap_returns_zero_avg() {
+        // ヒープなし関数 → sites_total=0, live_range_avg=0.0（分母0の値）
+        let f = func(&["p"], vec![], 10);
+        let r = analyze(&f);
+        let m = &r.functions[0].metrics;
+        assert_eq!(m.sites_total, 0);
+        assert_eq!(m.live_range_lines_total, 0);
+        // 分母0のとき 0.0
+        assert_eq!(m.live_range_avg, 0.0);
+    }
+
+    #[test]
+    fn transfer_density_consumed_function() {
+        // 既知の消費関数への渡し → transfers_total = 1
+        // 関数 span: 1-10 (10行) → density = 1 / (10 / 1000) = 1 / 0.01 = 100.0
+        let f = func(
+            &["p"],
+            vec![
+                (0, 3, heap()),
+                (
+                    0,
+                    5,
+                    EventKind::PassedTo {
+                        callee: "free".into(),
+                        consumed: Some(true),
+                    },
+                ),
+            ],
+            10,
+        );
+        let r = analyze(&f);
+        let m = &r.functions[0].metrics;
+        assert_eq!(m.transfers_total, 1);
+        assert_eq!(m.lines_analyzed, 10);
+        assert_eq!(m.transfer_density, 100.0);
+    }
+
+    #[test]
+    fn transfer_density_escape_return() {
+        // return による脱出 → transfers_total = 1
+        // 関数 span: 1-20 (20行) → density = 1 / (20 / 1000) = 1 / 0.02 = 50.0
+        let f = func(
+            &["p"],
+            vec![(0, 3, heap()), (0, 5, EventKind::EscapeReturn)],
+            20,
+        );
+        let r = analyze(&f);
+        let m = &r.functions[0].metrics;
+        assert_eq!(m.transfers_total, 1);
+        assert_eq!(m.lines_analyzed, 20);
+        assert_eq!(m.transfer_density, 50.0);
+    }
+
+    #[test]
+    fn transfer_density_multiple_transfers() {
+        // 複数の遷移がある場合 → transfers_total = 2
+        // p: L3 malloc → L5 消費関数へ
+        // q: L4 malloc → L6 return
+        // 関数 span: 1-10 (10行) → density = 2 / (10 / 1000) = 200.0
+        let f = func(
+            &["p", "q"],
+            vec![
+                (0, 3, heap()),
+                (1, 4, heap()),
+                (
+                    0,
+                    5,
+                    EventKind::PassedTo {
+                        callee: "free".into(),
+                        consumed: Some(true),
+                    },
+                ),
+                (1, 6, EventKind::EscapeReturn),
+            ],
+            10,
+        );
+        let r = analyze(&f);
+        let m = &r.functions[0].metrics;
+        assert_eq!(m.transfers_total, 2);
+        assert_eq!(m.lines_analyzed, 10);
+        assert_eq!(m.transfer_density, 200.0);
+    }
+
+    #[test]
+    fn transfer_density_no_transfers() {
+        // 移譲なし（単純な free のみ）→ transfers_total = 0, density = 0.0
+        let f = func(&["p"], vec![(0, 3, heap()), (0, 5, EventKind::Free)], 10);
+        let r = analyze(&f);
+        let m = &r.functions[0].metrics;
+        assert_eq!(m.transfers_total, 0);
+        assert_eq!(m.transfer_density, 0.0);
+    }
+
+    #[test]
+    fn transfer_density_no_heap_returns_zero() {
+        // ヒープなし関数 → transfers_total=0, lines_analyzed>0 → density=0.0
+        let f = func(&["p"], vec![], 20);
+        let r = analyze(&f);
+        let m = &r.functions[0].metrics;
+        assert_eq!(m.transfers_total, 0);
+        assert_eq!(m.lines_analyzed, 20);
+        assert_eq!(m.transfer_density, 0.0);
+    }
+
+    #[test]
+    fn metrics_aggregation_via_absorb() {
+        // 複数関数の指標が absorb で正しく集計される
+        // f1: 1つの Site, 1つの free 行, 生存区間 3
+        let f1 = func(&["p"], vec![(0, 3, heap()), (0, 5, EventKind::Free)], 6);
+        let r1 = analyze(&f1);
+
+        // f2: 1つの Site, 1つの消費関数移譲
+        let f2 = func(
+            &["q"],
+            vec![
+                (0, 3, heap()),
+                (
+                    0,
+                    5,
+                    EventKind::PassedTo {
+                        callee: "free".into(),
+                        consumed: Some(true),
+                    },
+                ),
+            ],
+            10,
+        );
+        let r2 = analyze(&f2);
+
+        // 手動で absorb シミュレーション
+        let mut total = r1.metrics.clone();
+        total.absorb(&r2.metrics);
+
+        // 期待値：
+        // sites_freed: 1 + 1 = 2
+        // free_sites_total: 1 + 1 = 2
+        // sites_multi_free: 0 + 0 = 0
+        // live_range_lines_total: (5-3+1) + (5-3+1) = 3 + 3 = 6
+        // transfers_total: 0 + 1 = 1
+        // lines_analyzed: 6 + 10 = 16
+        assert_eq!(total.sites_freed, 2);
+        assert_eq!(total.free_sites_total, 2);
+        assert_eq!(total.sites_multi_free, 0);
+        assert_eq!(total.live_range_lines_total, 6);
+        assert_eq!(total.transfers_total, 1);
+        assert_eq!(total.lines_analyzed, 16);
+    }
+
+    // --- P0対応: 複数回遷移テスト ---
+
+    #[test]
+    fn transfer_density_multiple_escapes_same_site() {
+        // 同一 Site に EscapeReturn を2回（行を変えて）
+        // → transfers_total = 2（遷移回数）
+        let f = func(
+            &["p"],
+            vec![
+                (0, 3, heap()),
+                (0, 5, EventKind::EscapeReturn), // 1回目の遷移
+                (0, 7, EventKind::EscapeReturn), // 2回目の遷移（同一 Site）
+            ],
+            8,
+        );
+        let r = analyze(&f);
+        let m = &r.functions[0].metrics;
+        assert_eq!(m.transfers_total, 2, "同一 Site への複数回遷移");
+    }
+
+    // --- P1-1対応: PassedTo 分岐での last_event_line 更新テスト ---
+
+    #[test]
+    fn live_range_with_passed_to_non_consuming() {
+        // 確保 → PassedTo{Some(false)} のみ → live_range が伸びる
+        // p: L3確保 → L5 非消費関数へ
+        // 生存区間 = 5 - 3 + 1 = 3
+        let f = func(
+            &["p"],
+            vec![
+                (0, 3, heap()),
+                (
+                    0,
+                    5,
+                    EventKind::PassedTo {
+                        callee: "strlen".into(),
+                        consumed: Some(false),
+                    },
+                ),
+            ],
+            6,
+        );
+        let r = analyze(&f);
+        let m = &r.functions[0].metrics;
+        assert_eq!(m.live_range_lines_total, 3);
+        assert_eq!(m.live_range_avg, 3.0);
+    }
+
+    #[test]
+    fn live_range_with_passed_to_unknown() {
+        // 確保 → PassedTo{None}（未知関数） → live_range が伸びる
+        // p: L3確保 → L5 未知関数へ
+        // 生存区間 = 5 - 3 + 1 = 3
+        let f = func(
+            &["p"],
+            vec![
+                (0, 3, heap()),
+                (
+                    0,
+                    5,
+                    EventKind::PassedTo {
+                        callee: "mystery".into(),
+                        consumed: None,
+                    },
+                ),
+            ],
+            6,
+        );
+        let r = analyze(&f);
+        let m = &r.functions[0].metrics;
+        assert_eq!(m.live_range_lines_total, 3);
+        assert_eq!(m.live_range_avg, 3.0);
+    }
+
+    // --- P1-2対応: 異常 facts (last < alloc) での panic 防止テスト ---
+
+    #[test]
+    fn no_panic_on_inverted_line_numbers() {
+        // 異常な facts: alloc_line > last_event_line の逆転をテスト。
+        // L1 では通常行番号は昇順だが、L2/L3 フロントエンドまたは手組み facts で
+        // 逆転が発生する可能性がある。例: alloc@L5 の後に Free@L2 というイベント列。
+        // このとき last_event_line=2, alloc_line=5 → 素の減算ではオーバーフロー panic。
+        // saturating_sub により安全に 1（最小値）になるべき。
+        let f = func(
+            &["p"],
+            vec![
+                (0, 5, heap()),          // alloc_line = 5
+                (0, 2, EventKind::Free), // last_event_line = 2 (逆転！)
+            ],
+            10,
+        );
+        let r = analyze(&f);
+        let m = &r.functions[0].metrics;
+        // last_event_line.saturating_sub(alloc_line) + 1
+        // = 2.saturating_sub(5) + 1 = 0 + 1 = 1
+        assert_eq!(
+            m.live_range_lines_total, 1,
+            "逆転時も saturating_sub で 1 になる"
+        );
+        // panic しなかった ✓
+    }
+
+    // --- P2対応: 軽微なテスト ---
+
+    #[test]
+    fn free_same_line_counted_once() {
+        // 同一行で free を2回呼ぶ → free_sites_total=1（BTreeSet の重複排除）
+        let f = func(
+            &["p"],
+            vec![
+                (0, 3, heap()),
+                (0, 5, EventKind::Free),
+                (0, 5, EventKind::Free), // 同じ行で2回
+            ],
+            6,
+        );
+        let r = analyze(&f);
+        let m = &r.functions[0].metrics;
+        assert_eq!(m.sites_freed, 1);
+        assert_eq!(m.free_sites_total, 1, "同一行での複数回解放は1行と数える");
+        assert_eq!(m.free_site_multiplicity, 1.0);
+    }
+
+    #[test]
+    fn empty_functions_transfer_density() {
+        // 空 Facts（functions: vec![]）→ metrics は全ゼロ → transfer_density=0.0
+        let facts = Facts {
+            schema_version: FACTS_SCHEMA_VERSION.into(),
+            file: "test.c".into(),
+            source: String::new(),
+            functions: vec![],
+        };
+        let r = analyze(&facts);
+        let m = &r.metrics;
+        assert_eq!(m.transfers_total, 0);
+        assert_eq!(m.lines_analyzed, 0);
+        assert_eq!(m.transfer_density, 0.0, "分母0の場合 0.0");
     }
 }

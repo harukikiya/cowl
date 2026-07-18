@@ -266,6 +266,15 @@ document.addEventListener('mouseover', (e) => {
 fn write_metric_cards(h: &mut String, m: &Metrics) {
     let warn_amb = if m.ambiguity_rate > 0.0 { " warn" } else { "" };
     let warn_iss = if m.issues_total > 0 { " warn" } else { "" };
+    // 解放サイト多重度は 1.0 が理想値（資源が唯一の箇所でのみ解放される状態）。
+    // 1.0 超は multiple-free のリスク構造を示唆するため、warn の根拠が自明。
+    // 一方 live_range_avg / transfer_density は閾値の根拠が実コード分布の観察を
+    // 必要とするため、現段階では warn 付けない（根拠なき閾値は付けない方針）。
+    let warn_mult = if m.free_site_multiplicity > 1.0 {
+        " warn"
+    } else {
+        ""
+    };
     let _ = write!(
         h,
         r#"<div class="cards">
@@ -273,6 +282,9 @@ fn write_metric_cards(h: &mut String, m: &Metrics) {
 <div class="card{}"><div class="k">所有権曖昧度</div><div class="v">{:.0}%</div></div>
 <div class="card"><div class="k">確保サイト</div><div class="v">{}</div></div>
 <div class="card{}"><div class="k">診断</div><div class="v">{}</div></div>
+<div class="card{}"><div class="k">解放サイト多重度</div><div class="v">{:.2}</div></div>
+<div class="card"><div class="k">平均生存区間</div><div class="v">{:.1}行</div></div>
+<div class="card"><div class="k">移譲密度</div><div class="v">{:.1}/KLOC</div></div>
 </div>
 "#,
         m.ownership_coverage * 100.0,
@@ -281,5 +293,139 @@ fn write_metric_cards(h: &mut String, m: &Metrics) {
         m.sites_total,
         warn_iss,
         m.issues_total,
+        warn_mult,
+        m.free_site_multiplicity,
+        m.live_range_avg,
+        m.transfer_density,
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::analysis::{Metrics, Report};
+    use crate::facts::Facts;
+
+    fn make_test_facts() -> Facts {
+        Facts {
+            schema_version: "0.1.0".into(),
+            file: "test.c".into(),
+            source: "int main() {\n  int *p = malloc(10);\n  free(p);\n}\n".into(),
+            functions: vec![],
+        }
+    }
+
+    fn make_test_report_with_metrics(metrics: Metrics) -> Report {
+        Report {
+            schema_version: "0.2.0".into(),
+            file: "test.c".into(),
+            functions: vec![],
+            metrics,
+        }
+    }
+
+    #[test]
+    fn test_new_metric_labels_in_output() {
+        // 3つの新指標のラベルが HTML 出力に含まれることを確認
+        let facts = make_test_facts();
+        let metrics = Metrics {
+            sites_total: 10,
+            sites_resolved: 9,
+            sites_ambiguous: 1,
+            ownership_coverage: 0.9,
+            ambiguity_rate: 0.1,
+            issues_total: 0,
+            issues_by_kind: Default::default(),
+            sites_freed: 4,
+            free_sites_total: 5,
+            sites_multi_free: 1,
+            free_site_multiplicity: 1.25,
+            live_range_lines_total: 30,
+            live_range_avg: 3.0,
+            transfers_total: 31,
+            lines_analyzed: 1000,
+            transfer_density: 31.0,
+        };
+        let report = make_test_report_with_metrics(metrics);
+        let html = render_html(&facts, &report);
+
+        assert!(
+            html.contains("解放サイト多重度"),
+            "新指標「解放サイト多重度」ラベルが出力に含まれるべき"
+        );
+        assert!(
+            html.contains("平均生存区間"),
+            "新指標「平均生存区間」ラベルが出力に含まれるべき"
+        );
+        assert!(
+            html.contains("移譲密度"),
+            "新指標「移譲密度」ラベルが出力に含まれるべき"
+        );
+    }
+
+    #[test]
+    fn test_free_site_multiplicity_warn_condition() {
+        // free_site_multiplicity > 1.0 のときに warn クラスが付き、
+        // 1.0 ちょうどでは付かないことを確認
+        let facts = make_test_facts();
+
+        // Case 1: multiplicity > 1.0 → warn が付く
+        let metrics_warn = Metrics {
+            sites_total: 10,
+            sites_resolved: 9,
+            sites_ambiguous: 1,
+            ownership_coverage: 0.9,
+            ambiguity_rate: 0.1,
+            issues_total: 0,
+            issues_by_kind: Default::default(),
+            sites_freed: 4,
+            free_sites_total: 5,
+            sites_multi_free: 1,
+            free_site_multiplicity: 1.5, // > 1.0
+            live_range_lines_total: 30,
+            live_range_avg: 3.0,
+            transfers_total: 31,
+            lines_analyzed: 1000,
+            transfer_density: 31.0,
+        };
+        let report_warn = make_test_report_with_metrics(metrics_warn);
+        let html_warn = render_html(&facts, &report_warn);
+
+        // "解放サイト多重度" ラベルの直後のカード要素に warn クラスが付いているか確認
+        let pattern_warn = r#"<div class="card warn"><div class="k">解放サイト多重度"#;
+        assert!(
+            html_warn.contains(pattern_warn),
+            "multiplicity > 1.0 のとき card に warn クラスが付くべき。\nHTML:\n{}",
+            html_warn
+        );
+
+        // Case 2: multiplicity == 1.0 → warn が付かない
+        let metrics_no_warn = Metrics {
+            sites_total: 10,
+            sites_resolved: 9,
+            sites_ambiguous: 1,
+            ownership_coverage: 0.9,
+            ambiguity_rate: 0.1,
+            issues_total: 0,
+            issues_by_kind: Default::default(),
+            sites_freed: 4,
+            free_sites_total: 4,
+            sites_multi_free: 0,
+            free_site_multiplicity: 1.0, // == 1.0（理想値）
+            live_range_lines_total: 30,
+            live_range_avg: 3.0,
+            transfers_total: 31,
+            lines_analyzed: 1000,
+            transfer_density: 31.0,
+        };
+        let report_no_warn = make_test_report_with_metrics(metrics_no_warn);
+        let html_no_warn = render_html(&facts, &report_no_warn);
+
+        let pattern_no_warn = r#"<div class="card"><div class="k">解放サイト多重度"#;
+        assert!(
+            html_no_warn.contains(pattern_no_warn),
+            "multiplicity == 1.0 のとき card に warn クラスが付かないべき。\nHTML:\n{}",
+            html_no_warn
+        );
+    }
 }
