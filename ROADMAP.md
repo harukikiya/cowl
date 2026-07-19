@@ -53,13 +53,32 @@
   → 修正・回帰テスト化。warn は multiplicity>1.0 のみ（根拠なき閾値は
   付けない）。demo.c 実測: 多重度1.25(warn) / 生存3.0行 / 移譲31.2/KLOC
 
-## W5: L2 フロントエンド（libclang）
+## W5: L2 フロントエンド（libclang） [x]
 - 内容: crates/cowl-front-clang/ 新設。clang-sys/clang クレートで
   同一 facts を出力。型情報により AssignOpaque と未知関数の一部を解消する
 - 受け入れ: cowl-front-ts のゴールデンテストと同じCソースで facts 互換
   （イベント列の差分が「精度向上」として説明できること）/ ADRあり
 - 備考: devcontainer に libclang は導入済み。ここまでは L1 を凍結して進む
+- [x] 完了 (2026-07-19): f5b886e — `clang` 2.0.0（features = runtime +
+  clang_10_0。Ubuntu の libclang は無版数リンクを持たずビルド時リンクが
+  失敗するため実行時 dlopen が必須と実測）で crates/cowl-front-clang 新設
+  （ADR-0007）。精度向上は (a)マクロ展開越しの既知関数解決 (b)const T*
+  仮引数への引き渡しを consumed:Some(false) と断定、の2点のみ。既知関数表は
+  front-ts から pub 化して共有（二重定義ドリフト防止）。L1 は pub 化以外
+  無変更＝凍結維持（既存19テスト無変更で緑）。互換ゴールデン13＋精度向上4＋
+  examples統合1の計18テスト。API接続（frontend 切替）は Request スキーマ
+  変更を伴うため W7 として起票。frontend-worker 実装＋qa-reviewer 承認
+  （P0/P1 ゼロ。P2 の文書補強2点=無名仮引数の取りこぼし明記・互換13本の
+  絞り込み根拠コメントは同コミットに反映）
 
 ## W6: 別名圧力（Aliasing Pressure）
 - 内容: 同一Siteに同時生存する書込可能エイリアスの最大数。W5の型情報が前提
 - 受け入れ: 指標定義のADR / add-metric 手順 / const圧力との区別をテストで固定
+
+## W7: フロントエンド切替の API 露出（L2 の配線）
+- 内容: Request に frontend 指定（省略時 "ts" = L1）を追加し、CLI / MCP /
+  VSCode拡張から L2 を選べるようにする。facts-schema スキルの3点セット厳守
+- 受け入れ: API バージョン更新＋ADR / 両フロントで examples 全部のレポート
+  生成が通る / 既定値 L1 のまま後方互換（既存ゴールデン不変）
+- 備考: ADR-0007 の follow-up。編集中バッファ（コンパイル不能断片）への
+  耐性は L1 の担当という役割分担（ADR-0002）を崩さない

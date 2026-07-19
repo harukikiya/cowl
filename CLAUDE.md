@@ -11,12 +11,15 @@ cowl-cli ──► cowl-api ──► cowl-front-ts ──► cowl-core
 cowl-mcp ──┘    │              │                ├─ facts       事実IR（契約）
  薄い殻     JSON契約      C→facts変換のみ       ├─ analysis    状態機械・指標・グラフ
                           (tree-sitter L1)      └─ render_*    HTML / DOT
+                cowl-front-clang ──► cowl-front-ts, cowl-core
+                (libclang L2。同一factsを出力。API未接続=W7。ADR-0007)
 ```
 
 | 層 | やってよいこと | やってはいけないこと |
 |---|---|---|
 | cowl-core | facts→解析→描画。純粋計算 | ファイルI/O・CLI・ネットワークを知ること |
 | cowl-front-ts | 構文事実の抽出 | 所有権の**解釈**・診断・指標計算 |
+| cowl-front-clang | 構文事実の抽出（libclang L2。既知関数表は front-ts と共有） | 所有権の**解釈**・診断・指標計算・L1凍結の破壊 |
 | cowl-api | Request/Response の写像 | 解析ロジックの実装 |
 | cowl-cli | 引数→Request の写像 | ロジック全般 |
 | cowl-mcp | MCPツール→Request の写像（rmcp。ADR-0004） | ロジック全般・エンベロープの再解釈 |

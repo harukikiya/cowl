@@ -30,14 +30,15 @@ echo '{"cmd":"analyze","source":"void f(void){char*p=malloc(4);}","file_name":"x
 ## 構成（1コア＋薄いシェル）
 
 ```
-cowl-cli ──► cowl-api ──► cowl-front-ts ──► cowl-core
-cowl-mcp ──┘
- (clap/rmcp) (JSON契約)   (tree-sitter L1)   (facts / analysis / render)
+cowl-cli ──► cowl-api ──► cowl-front-ts ──────► cowl-core
+cowl-mcp ──┘             cowl-front-clang ──┘
+ (clap/rmcp) (JSON契約)   (L1 tree-sitter /     (facts / analysis / render)
+                           L2 libclang)
 ```
 
 - 詳細な規約とレイヤ責務: **CLAUDE.md**（プロジェクト憲法）
 - 設計判断: docs/adr/
-- 今後のタスク: ROADMAP.md（W3: L1精度向上, W4: 指標第2陣, W5: libclang L2 …）
+- 今後のタスク: ROADMAP.md（W6: 別名圧力, W7: L2フロントエンドのAPI接続 …）
 
 ## 何が見えるか（examples/demo.c）
 
