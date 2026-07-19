@@ -1,0 +1,15 @@
+[package]
+name = "cowl-front-clang"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+# 依存の向き: cowl-front-clang → cowl-front-ts → cowl-core（一方向DAG）。
+# cowl-front-ts への依存は「テストコード用のパス」ではなく通常依存 —
+# ALLOC_FNS/CONSUMER_FNS/BENIGN_FNS/consumed_for を再利用するため
+# （ROADMAP W5の設計判断。表の二重定義によるドリフトを防ぐ）
+cowl-core = { path = "../cowl-core" }
+cowl-front-ts = { path = "../cowl-front-ts" }
+clang.workspace = true
+anyhow.workspace = true

@@ -40,7 +40,14 @@ use tree_sitter::{Node, Parser};
 /// これに伴い「確保関数と解放関数の対応が正しいか」（例: fopen したものを
 /// fclose ではなく free してしまう誤り）の検証はL1のスコープ外とする。
 /// L1は「解放系の呼び出しがあったか」だけを見て対応関係の妥当性は問わない
-const ALLOC_FNS: &[&str] = &[
+///
+/// `pub` にしている理由（W5）: cowl-front-clang（L2）が同じ表を再利用するため。
+/// 表は manpage 確認済みの知識そのものであり、L1/L2 で意味論が変わるわけでは
+/// ないので、二重定義してドリフトさせるより一方向DAG
+/// （cowl-front-clang → cowl-front-ts）で共有する方が安全（ROADMAP W5の設計判断）。
+/// 将来 front-ts/front-clang 双方から使う純粋ロジックが増えたら
+/// cowl-front-common への切り出しを検討する（W5では過剰設計を避けて見送り）
+pub const ALLOC_FNS: &[&str] = &[
     "malloc",
     "calloc",
     "realloc",
@@ -64,7 +71,9 @@ const ALLOC_FNS: &[&str] = &[
 /// 関数なので ALLOC_FNS にも載っている（`p = realloc(p, n)` のような自己代入は
 /// 「右辺で旧pを消費→左辺で新pを獲得」という順序になる。イベント順の扱いは
 /// classify_occurrence の assignment_expression ケースのコメント参照）
-const CONSUMER_FNS: &[(&str, usize)] = &[
+///
+/// `pub` にする理由は ALLOC_FNS のコメントと同じ（W5: cowl-front-clang が再利用）
+pub const CONSUMER_FNS: &[(&str, usize)] = &[
     ("fclose", 0),
     ("realloc", 0),
     ("reallocarray", 0),
@@ -84,7 +93,9 @@ const CONSUMER_FNS: &[(&str, usize)] = &[
 /// p は借用のまま（strdup は p の指す内容をコピーするだけで p 自体は
 /// 消費しない）— これが現状 p を曖昧扱いにしていた穴を塞ぐ。
 /// freopen は CONSUMER_FNS（第3引数=stream を消費）に載せたのでここには含めない
-const BENIGN_FNS: &[&str] = &[
+///
+/// `pub` にする理由は ALLOC_FNS のコメントと同じ（W5: cowl-front-clang が再利用）
+pub const BENIGN_FNS: &[&str] = &[
     "printf",
     "fprintf",
     "snprintf",
@@ -130,7 +141,12 @@ const BENIGN_FNS: &[&str] = &[
 /// 判定順（呼び出し元で free は先に弾いている前提）:
 ///   CONSUMER表にあり位置一致→Some(true) / 位置不一致→Some(false) /
 ///   BENIGN表にあり→Some(false) / どちらにも無い未知関数→None（曖昧）
-fn consumed_for(callee: &str, arg_pos: Option<usize>) -> Option<bool> {
+///
+/// `pub` にする理由は ALLOC_FNS のコメントと同じ（W5: cowl-front-clang が再利用）。
+/// この関数自体は表引きだけの純粋関数で、tree-sitter 依存が無いため
+/// そのまま横展開できる（L2側は「表に無ければ独自のconst規則を試す」を
+/// 呼び出し側で追加する。この関数自体には手を入れない）
+pub fn consumed_for(callee: &str, arg_pos: Option<usize>) -> Option<bool> {
     if let Some(&(_, consumer_pos)) = CONSUMER_FNS.iter().find(|(name, _)| *name == callee) {
         // CONSUMER表にあり位置一致→消費、位置不一致→非消費と断定
         // （表に載っている＝manpageで全引数の意味論を確認済みのため）。

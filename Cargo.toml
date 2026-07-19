@@ -3,28 +3,35 @@
 #
 # ワークスペース構成（依存の向きは一方向のDAG）:
 #
-#   cowl-cli ──► cowl-api ──► cowl-front-ts ──► cowl-core
-#   cowl-mcp ──┘
-#                                └──────────────────┘
+#   cowl-cli ──► cowl-api ──► cowl-front-ts ────► cowl-core
+#   cowl-mcp ──┘             cowl-front-clang ──┘      ▲
+#                                  │                    │
+#                                  └────────────────────┘
+#                            （既知関数表を通常依存で再利用。W5）
 #
-#   * cowl-core     : 事実IR(facts) + 解析(analysis) + 描画(render)。外界を知らない純粋層
-#   * cowl-front-ts : tree-sitter によるL1フロントエンド。「Cソース → facts」変換のみ担当
-#   * cowl-api      : JSON in/out の安定API。CLI/MCP/VSCode拡張はすべてここだけを叩く
-#   * cowl-cli      : clapベースの薄いシェル
-#   * cowl-mcp      : rmcp 2.2 による MCP サーバ（CLI と同格の薄い皮）
+#   * cowl-core        : 事実IR(facts) + 解析(analysis) + 描画(render)。外界を知らない純粋層
+#   * cowl-front-ts    : tree-sitter によるL1フロントエンド。「Cソース → facts」変換のみ担当
+#   * cowl-front-clang : libclang によるL2フロントエンド（W5）。同一facts、型情報で精度向上
+#   * cowl-api         : JSON in/out の安定API。CLI/MCP/VSCode拡張はすべてここだけを叩く
+#   * cowl-cli         : clapベースの薄いシェル
+#   * cowl-mcp         : rmcp 2.2 による MCP サーバ（CLI と同格の薄い皮）
 #
 # なぜこの分割か:
 #   - フロントエンドは将来 libclang 版(L2)に差し替える計画があるため、
-#     重い依存(tree-sitter)を独立クレートに隔離しておく
+#     重い依存(tree-sitter/libclang)を独立クレートに隔離しておく
 #   - MCPサーバやVSCode拡張を作るとき、cowl-api の JSON契約だけ見れば
 #     済むようにする（コア内部型に外部を依存させない）
 #   - tokio は cowl-mcp に隔離（CLI は同期のまま保つ）
+#   - cowl-front-clang は cowl-front-ts の既知関数表(ALLOC_FNS等)を再利用する
+#     （表の二重定義によるドリフトを防ぐ。W5時点ではAPI未接続 = cowl-api/cli/mcp
+#     からは呼ばれない。詳細は docs/adr/0007-l2-libclang-frontend.md）
 # =============================================================================
 [workspace]
 resolver = "2"
 members = [
     "crates/cowl-core",
     "crates/cowl-front-ts",
+    "crates/cowl-front-clang",
     "crates/cowl-api",
     "crates/cowl-cli",
     "crates/cowl-mcp",
@@ -46,6 +53,22 @@ thiserror = "2"
 tree-sitter = "0.25"
 tree-sitter-c = "0.24"
 clap = { version = "4", features = ["derive"] }
+
+# L2フロントエンド（cowl-front-clang 専用。ADR-0007）。
+# 安全ラッパの `clang` クレートを採用（生FFIの clang-sys 直叩きは不可避な場合のみ）。
+# features:
+#   - "runtime": libclang を実行時 dlopen する。Ubuntu の libclang1 パッケージは
+#     `libclang.so` の無版数シンボリックリンクを作らないため、ビルド時リンク
+#     （デフォルト）では `libclang-18.so.1` 等の版数付きファイルを発見できず失敗する。
+#     runtime機能ならプロセス起動後の実探索になり、標準ライブラリ検索パス
+#     （/usr/lib/x86_64-linux-gnu 等）から自動発見できる。ビルド時に
+#     LIBCLANG_PATH は不要（探索コード自体がバイナリに埋め込まれ、実行時に働く）。
+#     見つからない環境では実行時に LIBCLANG_PATH 環境変数で明示する
+#   - "clang_10_0": `clang` クレート2.0.0が定義するバージョン機能の最大値。
+#     Entity::evaluate()（NULL定数判定に使用）等がこの機能でしか有効化されない。
+#     実行時の libclang が18でも、10.0機能で生成されるシンボル集合は
+#     18の完全な部分集合なので安全（新しい方が古い機能を包含する）
+clang = { version = "2.0.0", features = ["runtime", "clang_10_0"] }
 
 # MCPサーバ（cowl-mcp 専用。ADR-0004。tokio を他クレートに漏らさないこと）
 rmcp = { version = "2.2", features = ["server", "macros", "transport-io", "schemars"] }
