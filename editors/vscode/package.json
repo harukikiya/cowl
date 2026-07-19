@@ -27,6 +27,19 @@
           "type": "string",
           "default": "cowl",
           "description": "cowl 実行ファイルのパス。PATH に無い場合は絶対パスを指定する（VS Code の設定値は変数展開されないため、${workspaceFolder} ではなく実際の絶対パスを書くこと。例: /workspaces/cowl/target/debug/cowl）"
+        },
+        "cowl.frontend": {
+          "type": "string",
+          "enum": [
+            "ts",
+            "clang"
+          ],
+          "enumDescriptions": [
+            "tree-sitter (L1)。libclang 不要で、編集中の壊れたコードにも強い",
+            "libclang (L2)。マクロ展開・const ポインタ引数まで見る高精度モード。実行環境に libclang 共有ライブラリが必要で、値はそのまま cowl へ送られ、見つからない場合はエラー表示になる"
+          ],
+          "default": "ts",
+          "description": "解析フロントエンド。値は解釈されずリクエストの frontend フィールドとしてそのまま cowl へ送られる（既定: ts）"
         }
       }
     }

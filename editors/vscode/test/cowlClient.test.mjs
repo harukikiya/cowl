@@ -76,6 +76,49 @@ describe("CowlClient と実バイナリ cowl serve --stdio の統合", () => {
     );
   });
 
+  // W7 受け入れ条件の固定: 設定 cowl.frontend の値が request JSON の
+  // frontend フィールドとしてサーバまで届き、L2 選択時に拡張→サーバの
+  // パイプラインが通ること。extension.ts 側は設定値をリクエストに載せる
+  // だけの素通し1行であり、VS Code 本体を起動する E2E はこの環境では
+  // 組めない（ADR-0005）ため、「frontend 付きリクエストが実バイナリと
+  // 往復する」ことをこの層で固定する。
+  // なお render_html の返す HTML からは「本当に L2 が使われたか」を安価に
+  // 判別できないため、配線先の判別検証は cowl-api 層のテスト
+  // （dispatch_analyze_with_clang_frontend）が担う
+  test("render_html: frontend:'clang' で L2 パイプラインが通り html が返る", async () => {
+    const res = await client.request({
+      cmd: "render_html",
+      source: SRC,
+      file_name: "buf.c",
+      frontend: "clang",
+    });
+    assert.equal(res.ok, true);
+    assert.equal(typeof res.html, "string");
+    assert.ok(
+      res.html.includes("<!doctype html>"),
+      "自己完結 HTML の doctype を含むこと"
+    );
+  });
+
+  // frontend が本当に request JSON に載って送信されている証拠:
+  // 不正値がサーバの serde で ok:false になる。クライアントのどこかで
+  // フィールドが落ちていれば既定 ts で成功してしまうので、この失敗こそが
+  // 「設定値が JSON に載る」ことの決定的な確認になる
+  test("render_html: 不正な frontend はサーバ側で ok:false になる（素通しの証拠）", async () => {
+    const res = await client.request({
+      cmd: "render_html",
+      source: SRC,
+      file_name: "buf.c",
+      frontend: "gcc",
+    });
+    assert.equal(res.ok, false);
+    assert.equal(typeof res.error, "string");
+
+    // エラー後もサーバは生きていて次のリクエストが通る（エンベロープ契約）
+    const good = await client.request({ cmd: "version" });
+    assert.equal(good.ok, true);
+  });
+
   // サーバの「エラーでも JSON を1行返してプロセスは落ちない」契約の確認。
   // request() は JSON.stringify を通すため文法的に壊れた JSON は送れない。
   // 代わりに Request として解釈不能な cmd を送り、サーバ側の

@@ -7,6 +7,7 @@ license.workspace = true
 [dependencies]
 cowl-core = { path = "../cowl-core" }
 cowl-front-ts = { path = "../cowl-front-ts" }
+cowl-front-clang = { path = "../cowl-front-clang" }
 serde.workspace = true
 serde_json.workspace = true
 anyhow.workspace = true

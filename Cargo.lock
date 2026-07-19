@@ -218,6 +218,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "cowl-core",
+ "cowl-front-clang",
  "cowl-front-ts",
  "serde",
  "serde_json",

@@ -36,6 +36,11 @@ pub struct AnalyzeArgs {
 
     /// source 指定時の表示名。省略時は "<memory>"
     pub file_name: Option<String>,
+
+    /// 解析フロントエンド。"ts" = tree-sitter L1（既定。libclang 不要）、
+    /// "clang" = libclang L2（マクロ展開・constポインタ引数の精度向上。
+    /// 実行環境に libclang 共有ライブラリが必要）。省略時は "ts"
+    pub frontend: Option<String>,
 }
 
 /// cowl_report_html / cowl_graph_dot ツールの引数
@@ -57,6 +62,11 @@ pub struct RenderArgs {
     /// レスポンスには「written: path」のみ載る（大きなHTMLをパイプに流さないため）。
     /// 未指定なら本文をそのまま返す
     pub out: Option<String>,
+
+    /// 解析フロントエンド。"ts" = tree-sitter L1（既定。libclang 不要）、
+    /// "clang" = libclang L2（マクロ展開・constポインタ引数の精度向上。
+    /// 実行環境に libclang 共有ライブラリが必要）。省略時は "ts"
+    pub frontend: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -86,7 +96,9 @@ impl ServerHandler for CowlServer {
                 "cowl MCPサーバ. 3つのツールで Cソースの所有権・ライフタイム解析を提供: \
                 cowl_analyze (facts + report), cowl_report_html (lifetime-band HTML), \
                 cowl_graph_dot (ownership graph in DOT format). \
-                各ツールは path または source のいずれかでソース指定（source 優先）"
+                各ツールは path または source のいずれかでソース指定（source 優先）。\
+                frontend で解析フロントエンドを選択可能（\"ts\"=tree-sitter L1（既定）/ \
+                \"clang\"=libclang L2）"
                     .to_string(),
             )
     }
@@ -95,6 +107,30 @@ impl ServerHandler for CowlServer {
 // ---------------------------------------------------------------------------
 // ツール実装（tool_router マクロが ToolRouter を生成）
 // ---------------------------------------------------------------------------
+
+/// MCP 引数の frontend 文字列を型付き `cowl_api::Frontend` へ写像する。
+///
+/// - なぜ引数構造体で `cowl_api::Frontend` を直接受けないか: rmcp の
+///   Parameters は引数構造体に schemars::JsonSchema を要求するため、
+///   直接使うには cowl-api 側へ derive を足すしかない。MCP という特定シェル
+///   の都合のスキーマ生成依存を API 層に漏らさないことを優先した（ADR-0008。
+///   CLI が clap の ValueEnum を API 層に求めないのと同じ理屈）
+/// - なぜ手書きの match 表でなく serde_json::from_value か: 有効値の集合
+///   （"ts"/"clang"）の定義を cowl-api の serde 属性の1箇所に留めるため。
+///   ここに対応表を書くと、将来フロントエンドが増えたとき同期漏れでドリフトする
+/// - 不正値は Err(String) → rmcp がツールレベルエラー（is_error:true）に
+///   変換する。引数の型検証はもともと MCP 層（rmcp のスキーマ検証）の責務
+///   なので、エンベロープの再解釈には当たらない
+fn parse_frontend(s: Option<String>) -> Result<Option<cowl_api::Frontend>, String> {
+    match s {
+        None => Ok(None),
+        Some(s) => serde_json::from_value(serde_json::Value::String(s.clone()))
+            .map(Some)
+            .map_err(|_| {
+                format!("frontend は \"ts\" か \"clang\" を指定してください（受領値: {s:?}）")
+            }),
+    }
+}
 
 /// dispatch の返り値を MCP Result に変換する共通処理。
 /// dispatch_json から返ってくるエンベロープJSONをそのまま text コンテンツとして返す
@@ -143,7 +179,9 @@ impl CowlServer {
 
     /// 所有権解析を実行する。
     /// facts と report を JSON で返す。
-    /// path または source でソース指定（source が優先）
+    /// path または source でソース指定（source が優先）。
+    /// frontend で解析フロントエンドを選択（"ts"=tree-sitter L1（既定）/
+    /// "clang"=libclang L2。要 libclang）
     #[tool]
     pub async fn cowl_analyze(
         &self,
@@ -153,6 +191,7 @@ impl CowlServer {
             path: args.path,
             source: args.source,
             file_name: args.file_name,
+            frontend: parse_frontend(args.frontend)?,
         };
         dispatch(&req)
     }
@@ -160,7 +199,9 @@ impl CowlServer {
     /// ライフタイム帯の自己完結HTMLレポートを生成する。
     /// out 指定時はファイルに書き、レスポンスにはパスだけ載る。
     /// 未指定なら本文をそのまま返す。
-    /// path または source でソース指定（source が優先）
+    /// path または source でソース指定（source が優先）。
+    /// frontend で解析フロントエンドを選択（"ts"=tree-sitter L1（既定）/
+    /// "clang"=libclang L2。要 libclang）
     #[tool]
     pub async fn cowl_report_html(
         &self,
@@ -171,6 +212,7 @@ impl CowlServer {
             source: args.source,
             file_name: args.file_name,
             out: args.out,
+            frontend: parse_frontend(args.frontend)?,
         };
         dispatch(&req)
     }
@@ -178,7 +220,9 @@ impl CowlServer {
     /// 所有権グラフの Graphviz DOT を生成する。
     /// out 指定時はファイルに書き、レスポンスにはパスだけ載る。
     /// 未指定なら本文をそのまま返す。
-    /// path または source でソース指定（source が優先）
+    /// path または source でソース指定（source が優先）。
+    /// frontend で解析フロントエンドを選択（"ts"=tree-sitter L1（既定）/
+    /// "clang"=libclang L2。要 libclang）
     #[tool]
     pub async fn cowl_graph_dot(
         &self,
@@ -189,6 +233,7 @@ impl CowlServer {
             source: args.source,
             file_name: args.file_name,
             out: args.out,
+            frontend: parse_frontend(args.frontend)?,
         };
         dispatch(&req)
     }
@@ -209,6 +254,9 @@ mod tests {
             path: None,
             source: Some("void f(void){ char *p = malloc(4); free(p); }".to_string()),
             file_name: Some("mem.c".to_string()),
+            // W7 のフィールド追加に伴う機械的追記（None = 従来挙動。
+            // このテストの検証内容・アサーションは W7 前から無変更）
+            frontend: None,
         };
 
         let result = dispatch(&req);
@@ -228,6 +276,9 @@ mod tests {
             path: Some("/nonexistent/file.c".to_string()),
             source: None,
             file_name: None,
+            // W7 のフィールド追加に伴う機械的追記（None = 従来挙動。
+            // このテストの検証内容・アサーションは W7 前から無変更）
+            frontend: None,
         };
 
         let result = dispatch(&req);
@@ -324,6 +375,69 @@ mod tests {
         assert!(json["dot"].is_string(), "should have dot key in response");
 
         // 後始末: クライアントを閉じ、サーバタスクを落とす
+        client.cancel().await?;
+        server_task.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_tool_call_with_frontend() -> anyhow::Result<()> {
+        // frontend 付きツール呼び出し（W7）。MCP プロトコル経由で
+        // 「JSON引数 → schemars/serde → parse_frontend → Request」の
+        // 写像経路全体を通す（メソッド直呼びでは引数のデシリアライズを
+        // 通らないため、あえてプロトコル越しにする）
+        use rmcp::model::CallToolRequestParams;
+        use rmcp::ServiceExt;
+
+        let (server_io, client_io) = tokio::io::duplex(1 << 16);
+        let server_task = tokio::spawn(async move {
+            let service = CowlServer::new().serve(server_io).await?;
+            service.waiting().await?;
+            anyhow::Ok(())
+        });
+        let client = ().serve(client_io).await?;
+
+        // frontend:"clang" の cowl_analyze が ok:true になり、かつ MCP 経路でも
+        // 本当に L2 へ配線されていること。fixture は L1/L2 で結果が分岐する
+        // マクロ展開（L1 なら assign_opaque / L2 なら alloc。cowl-api 側の
+        // dispatch_analyze_with_clang_frontend と同一の判別手法）。
+        // 単純な malloc/free では両フロントエンドの結果が同一になり
+        // 配線ミスを検出できないため、分岐する fixture で断定する
+        let mut call_req = CallToolRequestParams::new("cowl_analyze");
+        call_req.arguments = Some(rmcp::object!({
+            "source": "#define AA(n) malloc(n)\nvoid f(void){ char *p = AA(4); free(p); }",
+            "file_name": "mem.c",
+            "frontend": "clang"
+        }));
+        let res = client.call_tool(call_req).await?;
+        assert_ne!(res.is_error, Some(true));
+        let text = &res.content[0].as_text().expect("text content").text;
+        let json: serde_json::Value = serde_json::from_str(text)?;
+        assert_eq!(json["ok"], true);
+        // L2 の証拠: マクロ越しの獲得が alloc（L1 に誤配線なら assign_opaque）
+        assert_eq!(
+            json["facts"]["functions"][0]["events"][0]["kind"]["type"],
+            "alloc"
+        );
+
+        // 不正値 "gcc" はツールレベルエラー（is_error:true）になり、
+        // かつサーバは落ちず次の呼び出しを処理し続けること
+        let mut call_req = CallToolRequestParams::new("cowl_analyze");
+        call_req.arguments = Some(rmcp::object!({
+            "source": "void f(void){}",
+            "frontend": "gcc"
+        }));
+        let res = client.call_tool(call_req).await?;
+        assert_eq!(res.is_error, Some(true), "不正な frontend はツールエラー");
+
+        // 生存確認: 直後の frontend 省略呼び出し（従来挙動）が通る
+        let mut call_req = CallToolRequestParams::new("cowl_analyze");
+        call_req.arguments = Some(rmcp::object!({
+            "source": "void f(void){ char *p = malloc(4); free(p); }"
+        }));
+        let res = client.call_tool(call_req).await?;
+        assert_ne!(res.is_error, Some(true));
+
         client.cancel().await?;
         server_task.abort();
         Ok(())

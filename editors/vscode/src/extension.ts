@@ -123,10 +123,18 @@ async function showReport(): Promise<void> {
  */
 async function renderInto(doc: vscode.TextDocument): Promise<void> {
   try {
+    // 設定 cowl.frontend は**素通し**: 値の解釈・検証は一切せず、リクエストの
+    // frontend フィールドに載せるだけ（JSON 契約の再実装をしない: CLAUDE.md）。
+    // 不正値や libclang 不在は cowl 側がエラーエンベロープで返し、下の
+    // res.ok === false 分岐がそのまま表示する（拡張に新しいエラー経路は不要）
+    const frontend = vscode.workspace
+      .getConfiguration("cowl")
+      .get<string>("frontend", "ts");
     const res = await getClient().request({
       cmd: "render_html",
       source: doc.getText(),
       file_name: path.basename(doc.fileName),
+      frontend,
     });
     if (panel === undefined) {
       return; // 応答を待つ間にパネルが閉じられた

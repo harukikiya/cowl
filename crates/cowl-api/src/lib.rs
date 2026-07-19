@@ -27,11 +27,29 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 /// JSON API の版。req/res の形が変わったら上げる
-pub const API_VERSION: &str = "0.1.0";
+/// （0.2.0: Analyze/RenderHtml/RenderDot に frontend を追加。追加のみ＝マイナー。ADR-0008）
+pub const API_VERSION: &str = "0.2.0";
 
 // ---------------------------------------------------------------------------
 // リクエスト / レスポンス型
 // ---------------------------------------------------------------------------
+
+/// 解析フロントエンドの選択肢。JSON 値は "ts" / "clang"。
+///
+/// **cowl-core ではなく API 層に置く**: フロントエンド選択は「入力をどう
+/// facts にするか」という入力解決の概念＝リクエストの語彙であり、
+/// core は facts しか知らないという依存 DAG を守るため（ADR-0008）。
+/// 未知の値（例: "gcc"）は serde のパース失敗として err_json エンベロープに
+/// 落ちる — panic しない契約はここでも維持される
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Frontend {
+    /// tree-sitter L1（既定）。libclang 不要・編集中バッファ耐性（ADR-0002）
+    Ts,
+    /// libclang L2。マクロ展開・const ポインタ引数の精度向上。
+    /// 実行環境に libclang 共有ライブラリが必要（無ければエラーエンベロープ。ADR-0007）
+    Clang,
+}
 
 /// 受け付けるコマンド一覧。
 /// `path` と `source` は排他ではなく **source 優先**（両方来たら source を使う）。
@@ -48,6 +66,9 @@ pub enum Request {
         source: Option<String>,
         /// source 指定時の表示名（省略時 "<memory>"）
         file_name: Option<String>,
+        /// 解析フロントエンド（省略時 = Ts。欠落を None にする serde の
+        /// 挙動で旧クライアントの後方互換が自動的に成り立つ。ADR-0008）
+        frontend: Option<Frontend>,
     },
     /// ライフタイム帯HTML（自己完結・単一ファイル）を返す/書き出す
     RenderHtml {
@@ -56,6 +77,7 @@ pub enum Request {
         file_name: Option<String>,
         /// 指定時はファイルに書き、レスポンスにはパスだけ載せる
         out: Option<String>,
+        frontend: Option<Frontend>,
     },
     /// 所有権グラフの Graphviz DOT を返す/書き出す
     RenderDot {
@@ -63,6 +85,7 @@ pub enum Request {
         source: Option<String>,
         file_name: Option<String>,
         out: Option<String>,
+        frontend: Option<Frontend>,
     },
 }
 
@@ -77,18 +100,31 @@ pub struct Analyzed {
 // Rust関数API
 // ---------------------------------------------------------------------------
 
-/// 入力（path/source）を facts に解決する共通処理
+/// 入力（path/source）を facts に解決する共通処理。
+/// フロントエンドの分岐は**ここ1箇所だけ**: L1/L2 は W5 で意図的に同形の
+/// 公開API（extract_file / extract_source）を持たされており（ADR-0007）、
+/// facts が差し替えの継ぎ目であることをこの関数の薄さが体現している
 fn load(
+    frontend: Option<Frontend>,
     path: &Option<String>,
     source: &Option<String>,
     file_name: &Option<String>,
 ) -> Result<Facts> {
+    // 省略時 Ts: 後方互換＋「編集中バッファ耐性は L1 の担当」という
+    // 役割分担（ADR-0002/0007）を既定値の形で維持する（ADR-0008）
+    let fe = frontend.unwrap_or(Frontend::Ts);
     match (source, path) {
         (Some(src), _) => {
             let name = file_name.clone().unwrap_or_else(|| "<memory>".into());
-            cowl_front_ts::extract_source(src, &name)
+            match fe {
+                Frontend::Ts => cowl_front_ts::extract_source(src, &name),
+                Frontend::Clang => cowl_front_clang::extract_source(src, &name),
+            }
         }
-        (None, Some(p)) => cowl_front_ts::extract_file(p),
+        (None, Some(p)) => match fe {
+            Frontend::Ts => cowl_front_ts::extract_file(p),
+            Frontend::Clang => cowl_front_clang::extract_file(p),
+        },
         (None, None) => anyhow::bail!("path か source のどちらかが必要です"),
     }
 }
@@ -97,8 +133,9 @@ pub fn analyze(
     path: Option<String>,
     source: Option<String>,
     file_name: Option<String>,
+    frontend: Option<Frontend>,
 ) -> Result<Analyzed> {
-    let facts = load(&path, &source, &file_name)?;
+    let facts = load(frontend, &path, &source, &file_name)?;
     let report = cowl_core::analysis::analyze(&facts);
     Ok(Analyzed { facts, report })
 }
@@ -140,8 +177,9 @@ fn handle(req: Request) -> Result<serde_json::Value> {
             path,
             source,
             file_name,
+            frontend,
         } => {
-            let a = analyze(path, source, file_name)?;
+            let a = analyze(path, source, file_name, frontend)?;
             json!({
                 "ok": true,
                 "api_version": API_VERSION,
@@ -154,8 +192,9 @@ fn handle(req: Request) -> Result<serde_json::Value> {
             source,
             file_name,
             out,
+            frontend,
         } => {
-            let a = analyze(path, source, file_name)?;
+            let a = analyze(path, source, file_name, frontend)?;
             let html = render_html_string(&a);
             emit(html, out, "html")?
         }
@@ -164,8 +203,9 @@ fn handle(req: Request) -> Result<serde_json::Value> {
             source,
             file_name,
             out,
+            frontend,
         } => {
-            let a = analyze(path, source, file_name)?;
+            let a = analyze(path, source, file_name, frontend)?;
             let dot = render_dot_string(&a);
             emit(dot, out, "dot")?
         }
@@ -217,5 +257,112 @@ mod tests {
         let res: serde_json::Value =
             serde_json::from_str(&dispatch_json(r#"{"cmd":"version"}"#)).unwrap();
         assert_eq!(res["api_version"], API_VERSION);
+    }
+
+    // -----------------------------------------------------------------------
+    // フロントエンド選択（ADR-0008）のゴールデン
+    // -----------------------------------------------------------------------
+
+    /// (a) L2 (libclang) を明示選択した analyze が通り、**本当に L2 へ配線
+    /// されている**こと。fixture には L1/L2 で結果が分岐するマクロ展開
+    /// （ADR-0007 の精度向上(a)）を使う: L1 はマクロを展開できず
+    /// `AA` という未知関数の戻り値として assign_opaque に落ちるが、
+    /// L2 は展開後の callee="malloc" を見て alloc になる。
+    /// 単純な malloc/free では両フロントエンドの結果が同一になり、
+    /// 誤って L1 に配線されていても検出できない（qa の変異実験で実証済み）
+    /// ため、この分岐する fixture がイベント断定込みで配線を証明する
+    #[test]
+    fn dispatch_analyze_with_clang_frontend() {
+        let req = serde_json::json!({
+            "cmd": "analyze",
+            "source": "#define AA(n) malloc(n)\nvoid f(void){ char *p = AA(4); free(p); }",
+            "file_name": "mem.c",
+            "frontend": "clang"
+        })
+        .to_string();
+        let res: serde_json::Value = serde_json::from_str(&dispatch_json(&req)).unwrap();
+        assert_eq!(res["ok"], true);
+        // L2 の証拠: マクロ越しの獲得が alloc として観測される
+        // （L1 に誤配線されていれば assign_opaque になりここで落ちる）
+        assert_eq!(
+            res["facts"]["functions"][0]["events"][0]["kind"]["type"],
+            "alloc"
+        );
+        assert_eq!(res["report"]["metrics"]["ownership_coverage"], 1.0);
+    }
+
+    /// (b) frontend 省略と "ts" 明示は同一の facts を返すこと
+    /// （省略時既定 = Ts の凍結。後方互換の証拠その1）
+    #[test]
+    fn omitted_frontend_equals_explicit_ts() {
+        let base = serde_json::json!({
+            "cmd": "analyze",
+            "source": "void f(void){ char *p = malloc(4); free(p); }",
+            "file_name": "mem.c",
+        });
+        let mut with_ts = base.clone();
+        with_ts["frontend"] = serde_json::json!("ts");
+
+        let res_omitted: serde_json::Value =
+            serde_json::from_str(&dispatch_json(&base.to_string())).unwrap();
+        let res_ts: serde_json::Value =
+            serde_json::from_str(&dispatch_json(&with_ts.to_string())).unwrap();
+        assert_eq!(res_omitted["ok"], true);
+        // facts だけでなくレスポンス全体を比較する（report・エンベロープの
+        // 形まで含めて「省略 = ts 明示」であることを強く固定）
+        assert_eq!(res_omitted, res_ts);
+    }
+
+    /// (c) 未知のフロントエンド値は serde のパース失敗として ok:false の
+    /// エンベロープに落ちること（panic しない契約の維持）
+    #[test]
+    fn unknown_frontend_value_is_err_envelope() {
+        let req = serde_json::json!({
+            "cmd": "analyze",
+            "source": "void f(void){}",
+            "frontend": "gcc"
+        })
+        .to_string();
+        let res: serde_json::Value = serde_json::from_str(&dispatch_json(&req)).unwrap();
+        assert_eq!(res["ok"], false);
+        assert!(res["error"].is_string());
+    }
+
+    /// (d) examples/*.c 全7本が frontend:"clang" の render_html で ok:true。
+    /// 「両フロントエンドで examples が通る」証拠の L2 側
+    /// （L1 側は既存テスト＋make demo が担う）。
+    /// これは疎通の確認であって配線先の判別ではない
+    /// （判別は dispatch_analyze_with_clang_frontend が分岐 fixture で担う）
+    #[test]
+    fn all_examples_render_html_with_clang_frontend() {
+        // cargo test 実行時の CWD 契約に依存しないよう CARGO_MANIFEST_DIR
+        // から絶対パスを組み立てる（cowl-front-clang のテストと同じパターン）
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("examples");
+        let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(&dir)
+            .unwrap_or_else(|e| panic!("examples/ が読めない: {} ({e})", dir.display()))
+            .filter_map(|entry| entry.ok().map(|e| e.path()))
+            .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("c"))
+            .collect();
+        files.sort();
+        assert_eq!(files.len(), 7, "examples/*.c の本数が想定と違う: {files:?}");
+
+        for path in files {
+            let req = serde_json::json!({
+                "cmd": "render_html",
+                "path": path.to_str().unwrap(),
+                "frontend": "clang"
+            })
+            .to_string();
+            let res: serde_json::Value = serde_json::from_str(&dispatch_json(&req)).unwrap();
+            assert_eq!(res["ok"], true, "{}: ok:true でない: {res}", path.display());
+            assert!(
+                res["html"].is_string(),
+                "{}: html キーが無い",
+                path.display()
+            );
+        }
     }
 }

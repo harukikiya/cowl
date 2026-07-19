@@ -26,12 +26,39 @@ struct Cli {
     cmd: Cmd,
 }
 
+/// `--frontend` の値。cowl-api の Frontend と1対1だが、clap の ValueEnum
+/// 実装を API 層へ漏らさないためのローカル型（CLI は薄い殻で、API 層は
+/// CLI ライブラリの都合を知らない — cowl-mcp が schemars を cowl-api に
+/// 求めないのと同じ理屈。ADR-0008）。clap の既定 rename で "ts"/"clang" に
+/// なり、JSON 契約の値とそのまま一致する
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum FrontendArg {
+    /// tree-sitter L1（既定。libclang 不要）
+    Ts,
+    /// libclang L2（マクロ展開・constポインタ引数の精度向上。要 libclang）
+    Clang,
+}
+
+impl FrontendArg {
+    /// Request の JSON 値への写像。serde 実装を持たない clap ローカル型
+    /// なので、ここで文字列に落として json! に渡す
+    fn as_str(self) -> &'static str {
+        match self {
+            FrontendArg::Ts => "ts",
+            FrontendArg::Clang => "clang",
+        }
+    }
+}
+
 #[derive(Subcommand)]
 enum Cmd {
     /// 解析結果(facts+report)をJSONで出力する
     Analyze {
         /// 対象のCソースファイル
         file: String,
+        /// 解析フロントエンド
+        #[arg(long, value_enum, default_value_t = FrontendArg::Ts)]
+        frontend: FrontendArg,
     },
     /// ライフタイム帯の自己完結HTMLレポートを生成する
     Report {
@@ -39,6 +66,9 @@ enum Cmd {
         /// 出力先HTML（省略時は標準出力）
         #[arg(short, long)]
         out: Option<String>,
+        /// 解析フロントエンド
+        #[arg(long, value_enum, default_value_t = FrontendArg::Ts)]
+        frontend: FrontendArg,
     },
     /// 所有権グラフのGraphviz DOTを生成する
     Graph {
@@ -46,6 +76,9 @@ enum Cmd {
         /// 出力先DOT（省略時は標準出力）
         #[arg(short, long)]
         out: Option<String>,
+        /// 解析フロントエンド
+        #[arg(long, value_enum, default_value_t = FrontendArg::Ts)]
+        frontend: FrontendArg,
     },
     /// JSONリクエストサーバ（改行区切り、1行=1リクエスト）
     Serve {
@@ -60,12 +93,27 @@ enum Cmd {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
-        Cmd::Analyze { file } => {
-            let req = serde_json::json!({ "cmd": "analyze", "path": file }).to_string();
+        Cmd::Analyze { file, frontend } => {
+            // 既定値 ts を常に明示送信する（省略と "ts" 明示は API 契約上
+            // 同一挙動 — cowl-api のテスト omitted_frontend_equals_explicit_ts
+            // が固定済みなので、CLI 側で「省略時はフィールドを消す」分岐を
+            // 持つ必要がない。薄い殻に条件分岐を増やさない）
+            let req = serde_json::json!({
+                "cmd": "analyze", "path": file, "frontend": frontend.as_str()
+            })
+            .to_string();
             print_stdout(&cowl_api::dispatch_json(&req));
         }
-        Cmd::Report { file, out } => run_render("render_html", &file, out)?,
-        Cmd::Graph { file, out } => run_render("render_dot", &file, out)?,
+        Cmd::Report {
+            file,
+            out,
+            frontend,
+        } => run_render("render_html", &file, out, frontend)?,
+        Cmd::Graph {
+            file,
+            out,
+            frontend,
+        } => run_render("render_dot", &file, out, frontend)?,
         Cmd::Serve { stdio: _ } => serve_stdio()?,
         Cmd::Version => {
             print_stdout(&cowl_api::dispatch_json(r#"{"cmd":"version"}"#));
@@ -96,8 +144,11 @@ fn print_stdout(s: &str) {
 
 /// report/graph 共通の実行部。out 指定の有無で「ファイルに書く/そのまま出す」を
 /// API層の契約（emit）に合わせて切り替える
-fn run_render(cmd: &str, file: &str, out: Option<String>) -> Result<()> {
-    let req = serde_json::json!({ "cmd": cmd, "path": file, "out": out }).to_string();
+fn run_render(cmd: &str, file: &str, out: Option<String>, frontend: FrontendArg) -> Result<()> {
+    let req = serde_json::json!({
+        "cmd": cmd, "path": file, "out": out, "frontend": frontend.as_str()
+    })
+    .to_string();
     let res_s = cowl_api::dispatch_json(&req);
     let res: serde_json::Value = serde_json::from_str(&res_s)?;
     if res["ok"] != true {
