@@ -11,8 +11,8 @@ cowl-cli ──► cowl-api ──► cowl-front-ts ──► cowl-core
 cowl-mcp ──┘    │              │                ├─ facts       事実IR（契約）
  薄い殻     JSON契約      C→facts変換のみ       ├─ analysis    状態機械・指標・グラフ
                           (tree-sitter L1)      └─ render_*    HTML / DOT
-                cowl-front-clang ──► cowl-front-ts, cowl-core
-                (libclang L2。同一factsを出力。API未接続=W7。ADR-0007)
+                cowl-api ──► cowl-front-clang ──► cowl-front-ts, cowl-core
+                (libclang L2。同一factsを出力。Request.frontend="clang" で選択。ADR-0007/0008)
 ```
 
 | 層 | やってよいこと | やってはいけないこと |
@@ -32,6 +32,7 @@ make check     # fmt --check + clippy -D warnings + test（ワーカーの完了
 make test      # cargo test --workspace
 make demo      # examples/ → out/*.html, out/*.dot を再生成
 cargo run -p cowl-cli -- report examples/demo.c -o out/demo.html
+cargo run -p cowl-cli -- report examples/demo.c --frontend clang -o out/demo.html  # L2(libclang)で解析
 echo '{"cmd":"version"}' | cargo run -q -p cowl-cli -- serve --stdio   # JSON API手打ち
 cargo run -p cowl-mcp   # MCPサーバ(stdio)。検証: npx @modelcontextprotocol/inspector --cli target/debug/cowl-mcp --method tools/list
 make check-vscode       # VSCode拡張のビルド+テスト（node必須。Rustワーカーの完了条件には含めない）

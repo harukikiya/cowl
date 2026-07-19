@@ -75,10 +75,21 @@
 - 内容: 同一Siteに同時生存する書込可能エイリアスの最大数。W5の型情報が前提
 - 受け入れ: 指標定義のADR / add-metric 手順 / const圧力との区別をテストで固定
 
-## W7: フロントエンド切替の API 露出（L2 の配線）
+## W7: フロントエンド切替の API 露出（L2 の配線） [x]
 - 内容: Request に frontend 指定（省略時 "ts" = L1）を追加し、CLI / MCP /
   VSCode拡張から L2 を選べるようにする。facts-schema スキルの3点セット厳守
 - 受け入れ: API バージョン更新＋ADR / 両フロントで examples 全部のレポート
   生成が通る / 既定値 L1 のまま後方互換（既存ゴールデン不変）
 - 備考: ADR-0007 の follow-up。編集中バッファ（コンパイル不能断片）への
   耐性は L1 の担当という役割分担（ADR-0002）を崩さない
+- [x] 完了 (2026-07-19): a55667e — Request 3コマンドに frontend: Option<Frontend>
+  （"ts"/"clang"、省略時 ts）を追加し API_VERSION 0.2.0（ADR-0008。
+  facts/report スキーマは不変）。CLI --frontend / MCP 3ツール引数 /
+  VSCode 設定 cowl.frontend へ同時配線。MCP は文字列を serde 経由で
+  cowl_api::Frontend へ写像（schemars を api に漏らさず、有効値集合は
+  API 層の serde 定義に一元化）。新テスト7本（省略= ts 明示のレスポンス
+  完全一致、不正値エンベロープ、examples 全7本の clang render、マクロ
+  fixture による配線判別= ts:assign_opaque / clang:alloc）。qa が P1 を
+  2件検出（dispatch の doc 帰属消失を rustdoc 生成で実証／配線テストの
+  判別力不足を配線バグ注入の変異実験で実証）→ 修正・再レビューで承認。
+  claude ワーカー実装＋qa-reviewer 承認

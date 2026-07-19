@@ -18,6 +18,10 @@ open out/demo.html        # ライフタイム帯レポート（自己完結・�
 
 cargo run -p cowl-cli -- analyze examples/demo.c | jq .report.metrics
 cargo run -p cowl-cli -- graph examples/uaf_alias.c | dot -Tsvg > g.svg
+
+# L2(libclang)で解析する場合。ビルドには不要だが実行時に libclang が必要
+#（実行時 dlopen: ADR-0007。devcontainer には導入済み）
+cargo run -p cowl-cli -- report examples/demo.c --frontend clang -o out/demo2.html
 ```
 
 JSON API（VSCode拡張が spawn する。MCPサーバ cowl-mcp は同一プロセスで同じ契約を直接叩く: ADR-0004）:
@@ -38,7 +42,7 @@ cowl-mcp ──┘             cowl-front-clang ──┘
 
 - 詳細な規約とレイヤ責務: **CLAUDE.md**（プロジェクト憲法）
 - 設計判断: docs/adr/
-- 今後のタスク: ROADMAP.md（W6: 別名圧力, W7: L2フロントエンドのAPI接続 …）
+- 今後のタスク: ROADMAP.md（W6: 別名圧力 …）
 
 ## 何が見えるか（examples/demo.c）
 
