@@ -275,6 +275,14 @@ fn write_metric_cards(h: &mut String, m: &Metrics) {
     } else {
         ""
     };
+    // 別名圧力は 2 以上が「同じリソースに同時に書ける名前が複数ある」
+    // ＝ Rust の借用規則排他が破れている状態そのもの。
+    // 1 は単独所有で正常。2 以上は明らかな警告対象（ADR-0009）。
+    let warn_alias = if m.aliasing_pressure_max >= 2 {
+        " warn"
+    } else {
+        ""
+    };
     let _ = write!(
         h,
         r#"<div class="cards">
@@ -285,6 +293,9 @@ fn write_metric_cards(h: &mut String, m: &Metrics) {
 <div class="card{}"><div class="k">解放サイト多重度</div><div class="v">{:.2}</div></div>
 <div class="card"><div class="k">平均生存区間</div><div class="v">{:.1}行</div></div>
 <div class="card"><div class="k">移譲密度</div><div class="v">{:.1}/KLOC</div></div>
+<div class="card{}"><div class="k">別名圧力（最大）</div><div class="v">{}</div></div>
+<div class="card"><div class="k">圧力2以上の Site 数</div><div class="v">{}</div></div>
+<div class="card"><div class="k">別名不明束縛数</div><div class="v">{}</div></div>
 </div>
 "#,
         m.ownership_coverage * 100.0,
@@ -297,6 +308,10 @@ fn write_metric_cards(h: &mut String, m: &Metrics) {
         m.free_site_multiplicity,
         m.live_range_avg,
         m.transfer_density,
+        warn_alias,
+        m.aliasing_pressure_max,
+        m.aliasing_pressure_sites,
+        m.aliasing_unknown_bindings,
     );
 }
 
@@ -317,7 +332,7 @@ mod tests {
 
     fn make_test_report_with_metrics(metrics: Metrics) -> Report {
         Report {
-            schema_version: "0.2.0".into(),
+            schema_version: "0.3.0".into(),
             file: "test.c".into(),
             functions: vec![],
             metrics,
@@ -326,7 +341,7 @@ mod tests {
 
     #[test]
     fn test_new_metric_labels_in_output() {
-        // 3つの新指標のラベルが HTML 出力に含まれることを確認
+        // 3つの新指標のラベルが HTML 出力に含まれることを確認（W6指標含む）
         let facts = make_test_facts();
         let metrics = Metrics {
             sites_total: 10,
@@ -345,7 +360,9 @@ mod tests {
             transfers_total: 31,
             lines_analyzed: 1000,
             transfer_density: 31.0,
-            ..Default::default()
+            aliasing_pressure_max: 2,
+            aliasing_pressure_sites: 3,
+            aliasing_unknown_bindings: 1,
         };
         let report = make_test_report_with_metrics(metrics);
         let html = render_html(&facts, &report);
@@ -361,6 +378,18 @@ mod tests {
         assert!(
             html.contains("移譲密度"),
             "新指標「移譲密度」ラベルが出力に含まれるべき"
+        );
+        assert!(
+            html.contains("別名圧力（最大）"),
+            "新指標「別名圧力（最大）」ラベルが出力に含まれるべき"
+        );
+        assert!(
+            html.contains("圧力2以上の Site 数"),
+            "新指標「圧力2以上の Site 数」ラベルが出力に含まれるべき"
+        );
+        assert!(
+            html.contains("別名不明束縛数"),
+            "新指標「別名不明束縛数」ラベルが出力に含まれるべき"
         );
     }
 
@@ -388,7 +417,9 @@ mod tests {
             transfers_total: 31,
             lines_analyzed: 1000,
             transfer_density: 31.0,
-            ..Default::default()
+            aliasing_pressure_max: 0,
+            aliasing_pressure_sites: 0,
+            aliasing_unknown_bindings: 0,
         };
         let report_warn = make_test_report_with_metrics(metrics_warn);
         let html_warn = render_html(&facts, &report_warn);
@@ -419,7 +450,9 @@ mod tests {
             transfers_total: 31,
             lines_analyzed: 1000,
             transfer_density: 31.0,
-            ..Default::default()
+            aliasing_pressure_max: 0,
+            aliasing_pressure_sites: 0,
+            aliasing_unknown_bindings: 0,
         };
         let report_no_warn = make_test_report_with_metrics(metrics_no_warn);
         let html_no_warn = render_html(&facts, &report_no_warn);
@@ -429,6 +462,115 @@ mod tests {
             html_no_warn.contains(pattern_no_warn),
             "multiplicity == 1.0 のとき card に warn クラスが付かないべき。\nHTML:\n{}",
             html_no_warn
+        );
+    }
+
+    #[test]
+    fn test_aliasing_pressure_max_warn_condition() {
+        // aliasing_pressure_max >= 2 のときに warn クラスが付き、
+        // < 2 では付かないことを確認（ADR-0009）
+        let facts = make_test_facts();
+
+        // Case 1: max >= 2 → warn が付く
+        let metrics_warn = Metrics {
+            sites_total: 10,
+            sites_resolved: 9,
+            sites_ambiguous: 1,
+            ownership_coverage: 0.9,
+            ambiguity_rate: 0.1,
+            issues_total: 0,
+            issues_by_kind: Default::default(),
+            sites_freed: 4,
+            free_sites_total: 4,
+            sites_multi_free: 0,
+            free_site_multiplicity: 1.0,
+            live_range_lines_total: 30,
+            live_range_avg: 3.0,
+            transfers_total: 31,
+            lines_analyzed: 1000,
+            transfer_density: 31.0,
+            aliasing_pressure_max: 2, // >= 2
+            aliasing_pressure_sites: 1,
+            aliasing_unknown_bindings: 0,
+        };
+        let report_warn = make_test_report_with_metrics(metrics_warn);
+        let html_warn = render_html(&facts, &report_warn);
+
+        let pattern_warn = r#"<div class="card warn"><div class="k">別名圧力（最大）"#;
+        assert!(
+            html_warn.contains(pattern_warn),
+            "aliasing_pressure_max >= 2 のとき card に warn クラスが付くべき。\nHTML:\n{}",
+            html_warn
+        );
+
+        // Case 2: max < 2 → warn が付かない（単独所有・理想値）
+        let metrics_no_warn = Metrics {
+            sites_total: 10,
+            sites_resolved: 9,
+            sites_ambiguous: 1,
+            ownership_coverage: 0.9,
+            ambiguity_rate: 0.1,
+            issues_total: 0,
+            issues_by_kind: Default::default(),
+            sites_freed: 4,
+            free_sites_total: 4,
+            sites_multi_free: 0,
+            free_site_multiplicity: 1.0,
+            live_range_lines_total: 30,
+            live_range_avg: 3.0,
+            transfers_total: 31,
+            lines_analyzed: 1000,
+            transfer_density: 31.0,
+            aliasing_pressure_max: 1, // < 2（理想値）
+            aliasing_pressure_sites: 0,
+            aliasing_unknown_bindings: 0,
+        };
+        let report_no_warn = make_test_report_with_metrics(metrics_no_warn);
+        let html_no_warn = render_html(&facts, &report_no_warn);
+
+        let pattern_no_warn = r#"<div class="card"><div class="k">別名圧力（最大）"#;
+        assert!(
+            html_no_warn.contains(pattern_no_warn),
+            "aliasing_pressure_max < 2 のとき card に warn クラスが付かないべき。\nHTML:\n{}",
+            html_no_warn
+        );
+    }
+
+    #[test]
+    fn test_aliasing_unknown_bindings_zero_display() {
+        // aliasing_unknown_bindings が 0 でも値が表示されることを確認
+        let facts = make_test_facts();
+        let metrics = Metrics {
+            sites_total: 10,
+            sites_resolved: 9,
+            sites_ambiguous: 1,
+            ownership_coverage: 0.9,
+            ambiguity_rate: 0.1,
+            issues_total: 0,
+            issues_by_kind: Default::default(),
+            sites_freed: 4,
+            free_sites_total: 4,
+            sites_multi_free: 0,
+            free_site_multiplicity: 1.0,
+            live_range_lines_total: 30,
+            live_range_avg: 3.0,
+            transfers_total: 31,
+            lines_analyzed: 1000,
+            transfer_density: 31.0,
+            aliasing_pressure_max: 1,
+            aliasing_pressure_sites: 0,
+            aliasing_unknown_bindings: 0, // ゼロでも表示される
+        };
+        let report = make_test_report_with_metrics(metrics);
+        let html = render_html(&facts, &report);
+
+        assert!(
+            html.contains("別名不明束縛数"),
+            "「別名不明束縛数」ラベルが出力に含まれるべき"
+        );
+        assert!(
+            html.contains("<div class=\"card\"><div class=\"k\">別名不明束縛数</div><div class=\"v\">0</div></div>"),
+            "aliasing_unknown_bindings が 0 のときも値が表示されるべき"
         );
     }
 }
