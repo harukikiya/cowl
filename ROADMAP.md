@@ -71,9 +71,21 @@
   （P0/P1 ゼロ。P2 の文書補強2点=無名仮引数の取りこぼし明記・互換13本の
   絞り込み根拠コメントは同コミットに反映）
 
-## W6: 別名圧力（Aliasing Pressure）
+## W6: 別名圧力（Aliasing Pressure） [x]
 - 内容: 同一Siteに同時生存する書込可能エイリアスの最大数。W5の型情報が前提
 - 受け入れ: 指標定義のADR / add-metric 手順 / const圧力との区別をテストで固定
+- [x] 完了 (2026-07-20): b08f270+2a8fa26+3a3198b+0c2466e — facts 0.2.0
+  （VarDecl.pointee_const: L1=宣言指定子の構文判定・typedef は None、
+  L2=canonical 型解決で typedef を見通す精度向上。互換ゴールデン13本に
+  一致検証を拡張）、report 0.3.0（aliasing_pressure_max / _sites /
+  _unknown_bindings）、カード3枚（warn は最大値>=2。定義と操作化は
+  ADR-0009）。const 束縛は数えない＝const 圧力との区別、None は過小申告側
+  ＋可視化、をテストで固定。qa が変異実験の応用で P0 を検出（Alloc 再代入で
+  旧 Site の束縛が残る stale による過大計上）→ Heap/AddressOf 両経路を
+  共通化して修正、回帰テスト2本は「修正を外すと 3/2 で落ちる」ことまで実証。
+  AddressOf の Site 化は現行 facts では原理的に不可能と判明し対象を Heap に
+  縮小（W8 起票）。examples 出力は新カード以外 1 ビット不変を worktree diff
+  で実測。frontend/analysis/render/claude 各ワーカー実装＋qa-reviewer 承認
 
 ## W7: フロントエンド切替の API 露出（L2 の配線） [x]
 - 内容: Request に frontend 指定（省略時 "ts" = L1）を追加し、CLI / MCP /
@@ -93,3 +105,11 @@
   2件検出（dispatch の doc 帰属消失を rustdoc 生成で実証／配線テストの
   判別力不足を配線バグ注入の変異実験で実証）→ 修正・再レビューで承認。
   claude ワーカー実装＋qa-reviewer 承認
+
+## W8: AddressOf 別名の Site 化（facts 拡張）
+- 内容: AllocSource::AddressOf に取得元識別子を追加し、`&x` 由来の借用別名も
+  別名圧力の対象 Site にする（ADR-0009 で Heap に縮小した対象の解除）
+- 受け入れ: facts-schema 3点セット / 同一取得元への `&x` 2箇所が同一 Site に
+  束ねられることをテストで固定 / L1・L2 両フロント同期
+- 備考: W6 の qa レビューで判明した原理的制約（unit variant に識別情報が無い）
+  への対応。優先度は低（スタック別名の圧力はヒープより実害が小さい）
