@@ -671,7 +671,10 @@ fn analyze_function(f: &FunctionFacts) -> FunctionReport {
                             note: format!("{} で確保", func),
                         });
                     }
-                    AllocSource::AddressOf => {
+                    // target（ADR-0010/W8-1）は圧力計上側の拡張（次段）が使う。
+                    // この段では facts の形に追随するだけで、束縛の遷移
+                    // （Borrowへの上書き）自体は1ビットも変えない
+                    AllocSource::AddressOf { .. } => {
                         bindings[vi] = Binding::Borrow;
                         marks[vi].push(Mark {
                             line,
@@ -1367,7 +1370,9 @@ mod tests {
                     0,
                     3,
                     EventKind::Alloc {
-                        source: AllocSource::AddressOf,
+                        // target(W8-1): この束縛遷移テストではtargetの値自体は
+                        // 無関係（束縛先の変数名は問わない）なのでNoneで足りる
+                        source: AllocSource::AddressOf { target: None },
                     },
                 ),
                 (0, 4, EventKind::Free),
@@ -1988,7 +1993,12 @@ mod tests {
                     0,
                     5,
                     EventKind::Alloc {
-                        source: AllocSource::AddressOf,
+                        // target(W8-1): コメント通り `p = &x;` を模すのでSome("x")。
+                        // この段では圧力計上はtargetを見ない（次段の仕事）ので
+                        // 値そのものはunbind検証の結果に影響しない
+                        source: AllocSource::AddressOf {
+                            target: Some("x".to_string()),
+                        },
                     },
                 ),
                 (2, 6, EventKind::AssignFromVar { src: VarId(1) }),

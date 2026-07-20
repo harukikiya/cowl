@@ -741,9 +741,23 @@ fn interp_rhs(rhs: Node, src: &str, tracked: &HashMap<String, VarId>) -> EventKi
                 }
             }
         }
-        "pointer_expression" if op_text(v, src) == "&" => EventKind::Alloc {
-            source: AllocSource::AddressOf,
-        },
+        "pointer_expression" if op_text(v, src) == "&" => {
+            // target（ADR-0010）: 被演算子が単純識別子1個だけのときに限り
+            // Some(その名前)。ここは strip() 済みの v を経由しているが、
+            // v 自身の argument フィールドは剥がさずそのまま見る点が肝心
+            // ─ `&(x)` は argument が parenthesized_expression のままなので
+            // None に落ちる（括弧越しの同一性まで断定しない、の自己申告）。
+            // `&arr[i]` / `&s.f` / `&*p` も argument が複合式ノードになり
+            // 同様に None（実測: tree-sitterのnode-types.jsonでargumentは
+            // expression全般を許すフィールドで、括弧や添字を自動では剥がさない）
+            let target = v
+                .child_by_field_name("argument")
+                .filter(|a| a.kind() == "identifier")
+                .map(|a| text(a, src).to_string());
+            EventKind::Alloc {
+                source: AllocSource::AddressOf { target },
+            }
+        }
         // tree-sitter-c は NULL/nullptr を `null` ノードにする。
         // 環境差に備えて identifier "NULL" とリテラル 0 も拾う
         "null" => EventKind::AssignNull,
@@ -1031,7 +1045,73 @@ void f(void) {
         assert_eq!(
             ks[1],
             EventKind::Alloc {
-                source: AllocSource::AddressOf
+                source: AllocSource::AddressOf {
+                    target: Some("x".to_string())
+                }
+            }
+        );
+    }
+
+    // --- AddressOf の target 測定規則（ADR-0010 / W8-1） ---
+    // 「被演算子が単純識別子1個だけか」という**構文だけで判定できる**範囲に
+    // 意図的に絞っている。複合式は「同じ場所を指すか」を構文だけでは
+    // 断定できないため None に倒す（Unknownへの重複記録はしない自己申告）。
+
+    #[test]
+    fn address_of_target_subscript_is_none() {
+        // `&arr[i]` — i の実行時値次第でアドレスが変わりうる複合式
+        let ks = kinds_of("void f(void) { int arr[4]; int i = 0; int *p = &arr[i]; }");
+        assert_eq!(
+            ks[0],
+            EventKind::Alloc {
+                source: AllocSource::AddressOf { target: None }
+            }
+        );
+    }
+
+    #[test]
+    fn address_of_target_field_access_is_none() {
+        // `&s.f` — 構造体フィールドへの参照も複合式扱い
+        let ks = kinds_of("struct S { int f; }; void f(void) { struct S s; int *p = &s.f; }");
+        assert_eq!(
+            ks[0],
+            EventKind::Alloc {
+                source: AllocSource::AddressOf { target: None }
+            }
+        );
+    }
+
+    #[test]
+    fn address_of_target_deref_is_none() {
+        // `&*q` — デリファレンス越しも複合式扱い。q自身もポインタなので
+        // `*q` の出現がUse{Read}イベントを別に生む（qの識別子はexpr内で
+        // pのAllocより先に出現するのでks[0]がずれる）。events_ofで
+        // pのAllocイベントだけを名指しして拾う
+        let evs = events_of("void f(void) { int *q; int *p = &*q; }");
+        let alloc = evs
+            .iter()
+            .map(|(_, k)| k)
+            .find(|k| matches!(k, EventKind::Alloc { .. }))
+            .expect("pへのAllocイベントが見つからない");
+        assert_eq!(
+            *alloc,
+            EventKind::Alloc {
+                source: AllocSource::AddressOf { target: None }
+            }
+        );
+    }
+
+    #[test]
+    fn address_of_target_parenthesized_is_none() {
+        // `&(x)` — 括弧は他の文脈（strip()）では透過にするが、targetの測定では
+        // あえて剥がさない。「複合式でも括弧を剥がせば単純識別子と同じ」という
+        // 精度向上は L1/L2 の facts 互換（同一構文規則の維持。ADR-0010）を壊すため、
+        // 将来「単純化」したくなっても踏みとどまるための回帰テスト
+        let ks = kinds_of("void f(void) { int x = 0; int *p = &(x); }");
+        assert_eq!(
+            ks[0],
+            EventKind::Alloc {
+                source: AllocSource::AddressOf { target: None }
             }
         );
     }

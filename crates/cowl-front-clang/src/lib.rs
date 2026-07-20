@@ -615,8 +615,23 @@ fn classify_core<'tu>(core: Entity<'tu>, tracked: &HashMap<String, VarId>, src: 
                 .map(|op| unary_op_text(core, op, src) == "&")
                 .unwrap_or(false);
             if is_amp {
+                // target（ADR-0010）: L1と**同一の構文規則**（意味解析で深追い
+                // しない）。「被演算子がDeclRefExpr単体か」だけを見て、
+                // strip_transparent は使わない ─ ParenExprを挟む `&(x)` まで
+                // 剥がしてしまうとL1(tree-sitterのargumentフィールドをそのまま
+                // 見る＝括弧越しはNone)と切り出し方がずれ、フロントエンド
+                // 差し替えの継ぎ目であるfacts互換が壊れる。
+                // 実測（AST dump）で確認済み: `&x`はUnaryOperatorの直接の子が
+                // DeclRefExprそのものだが、`&arr[i]`/`&s.f`/`&(x)`/`&*p`は
+                // ArraySubscriptExpr/MemberRefExpr/ParenExpr/UnaryOperatorが
+                // 挟まるため直接の子はDeclRefExprにならない
+                // （`&`はlvalueのままの被演算子を取るためImplicitCastExpr/
+                // UnexposedExprも挟まらず、単純識別子ケースで揺れない）
+                let target = operand
+                    .filter(|op| op.get_kind() == EntityKind::DeclRefExpr)
+                    .and_then(|op| op.get_name());
                 EventKind::Alloc {
-                    source: AllocSource::AddressOf,
+                    source: AllocSource::AddressOf { target },
                 }
             } else {
                 EventKind::AssignOpaque {
@@ -1097,6 +1112,53 @@ void f(void) {
     int *b = &x;
 }
 "#,
+        );
+    }
+
+    #[test]
+    fn compat_address_of_target_matches_between_frontends() {
+        // ADR-0010 (W8-1): `&x` の被演算子が単純識別子のときの target。
+        // assert_l1_l2_compatible（compat_null_and_address_of_inits）の
+        // Shape::Alloc は AllocSource ごと比較するのでtargetの不一致も
+        // 検出できるが、それだけだと「L1/L2が同じ値で両方とも間違っている」
+        // ケースは見逃す。ここでは期待値 Some("x") を明示し、両フロントを
+        // 独立に検証する
+        let src = "void f(void) { int x = 0; int *b = &x; }";
+        let expected = EventKind::Alloc {
+            source: AllocSource::AddressOf {
+                target: Some("x".to_string()),
+            },
+        };
+        let f1 = cowl_front_ts::extract_source(src, "t.c").expect("L1 extract");
+        let f2 = extract_source(src, "t.c").expect("L2 extract");
+        assert_eq!(
+            f1.functions[0].events[0].kind, expected,
+            "L1のtargetが期待値と違う"
+        );
+        assert_eq!(
+            f2.functions[0].events[0].kind, expected,
+            "L2のtargetが期待値と違う"
+        );
+    }
+
+    #[test]
+    fn compat_address_of_target_compound_expr_is_none_on_both_frontends() {
+        // 複合式（`&arr[i]`）はL1/L2とも target=None に倒れることを固定する
+        // （ADR-0010: L2も意味解析で深追いせずL1と同じ構文規則を使う。
+        // ここが割れるとフロントエンド差し替えの継ぎ目＝facts互換が壊れる）
+        let src = "void f(void) { int arr[4]; int i = 0; int *p = &arr[i]; }";
+        let expected = EventKind::Alloc {
+            source: AllocSource::AddressOf { target: None },
+        };
+        let f1 = cowl_front_ts::extract_source(src, "t.c").expect("L1 extract");
+        let f2 = extract_source(src, "t.c").expect("L2 extract");
+        assert_eq!(
+            f1.functions[0].events[0].kind, expected,
+            "L1のtargetが期待値と違う"
+        );
+        assert_eq!(
+            f2.functions[0].events[0].kind, expected,
+            "L2のtargetが期待値と違う"
         );
     }
 

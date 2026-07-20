@@ -23,7 +23,8 @@ use serde::{Deserialize, Serialize};
 /// facts スキーマのバージョン。
 /// 互換性が壊れる変更（フィールド削除・意味変更）ではメジャーを上げる。
 /// 0.2.0: VarDecl に pointee_const を追加（ADR-0009 W6-1）。追加のみなのでマイナー
-pub const FACTS_SCHEMA_VERSION: &str = "0.2.0";
+/// 0.3.0: AllocSource::AddressOf に target を追加（ADR-0010 W8-1）。追加のみなのでマイナー
+pub const FACTS_SCHEMA_VERSION: &str = "0.3.0";
 
 /// ソース上の位置。行・列とも **1始まり**（エディタ表示と揃えるため）。
 /// tree-sitter は0始まりの row/column を返すので、フロントエンド側で +1 する。
@@ -161,7 +162,21 @@ pub enum AllocSource {
     Heap { func: String },
     /// `&x` によるアドレス取得。これは**借用**であり free してはいけない。
     /// Rustの参照に相当する概念なので区別して持つ
-    AddressOf,
+    AddressOf {
+        /// `&` の被演算子として現れた構文テキスト（ADR-0010 / W8-1）。
+        /// 単純識別子（`&x`）のときだけ Some(その名前) とし、`&arr[i]` /
+        /// `&s.f` / `&*p` / `&(x)` のような複合式は None にする。
+        /// 「複合式でも同じテキストなら同じアドレスだろう」という**同一性の
+        /// 断定**は構文だけでは行えない（`arr[i]` は i の実行時値次第で
+        /// 別アドレスになりうる）ため、判定できない場合は素直に None を
+        /// 自己申告する（Unknown への重複記録はしない。ADR-0009と同じ扱い）。
+        /// target を「同じ変数への借用として束ねてよいか」の解釈は
+        /// analysis 層の仕事（facts firewall）。
+        /// `#[serde(default)]` は 0.2.0 以前の JSON（このフィールドが無い）を
+        /// 読み込んだときに None へ後方互換で落とすため
+        #[serde(default)]
+        target: Option<String>,
+    },
 }
 
 /// 使用の向き。L1では読み書きの厳密判定はせず、
