@@ -1382,6 +1382,16 @@ void f(void) {
     }
 
     #[test]
+    fn pointee_const_true_for_postfix_qualifier() {
+        // `char const *p`（qualifier後置＝east const）も pointee const。
+        // 語順が違うだけで最初の`*`より前にconstが現れる点は同じだが、
+        // 前置形しかテストが無いと語順依存の退行に気づけないため固定する
+        // （qa W6 レビュー P2）
+        let f = extract_source("void f(void) { char const *p = 0; }", "t.c").unwrap();
+        assert_eq!(f.functions[0].vars[0].pointee_const, Some(true));
+    }
+
+    #[test]
     fn pointee_const_false_for_plain_pointer() {
         // constが無く、型指定子(primitive_type)も可視なので Some(false) と断定できる
         let f = extract_source("void f(void) { char *p = 0; }", "t.c").unwrap();

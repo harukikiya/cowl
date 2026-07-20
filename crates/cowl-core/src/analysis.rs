@@ -605,6 +605,19 @@ fn analyze_function(f: &FunctionFacts) -> FunctionReport {
                         });
                     }
                 }
+                // Alloc はどの source でも vi の旧束縛を終わらせる（Heap なら
+                // 新 Site へ、AddressOf なら Borrow へ上書き）。だから旧 Site
+                // からの解除は分岐に入る前にここで共通に行う（AssignFromVar /
+                // AssignNull / AssignOpaque の各分岐と対称）。この対称性を
+                // 欠くと旧 Site の current_bindings に stale な束縛が残り、
+                // 以後その Site に別の変数が束縛されたとき、もう指していない
+                // 変数まで書込可能数に数えて別名圧力を過大計上してしまう
+                if let Binding::Site { site: old_site, .. } = bindings[vi] {
+                    unbind_from_site(&mut sites, old_site, VarId(vi as u32));
+                    if update_aliasing_pressure(&mut sites, old_site, &mut metrics) {
+                        metrics.aliasing_pressure_sites += 1;
+                    }
+                }
                 match source {
                     AllocSource::Heap { func } => {
                         let sid = SiteId(site_seq);
@@ -1929,5 +1942,65 @@ mod tests {
         let m = &r.functions[0].metrics;
         assert_eq!(m.aliasing_pressure_max, 3, "3つの書込可能束縛");
         assert_eq!(m.aliasing_pressure_sites, 1);
+    }
+
+    #[test]
+    fn aliasing_pressure_realloc_unbinds_old_site() {
+        // Alloc 再代入の unbind 漏れの回帰テスト（qa W6 レビュー P0 の再現）。
+        //   p = malloc(A); q = p;   // Site A: {p,q} → max=2
+        //   p = malloc(B);          // p の直接再確保。A から p が外れること
+        //   r = q;                  // A に r 追加 → A は {q,r} の2
+        // 真の最大は2。修正前は Alloc 分岐だけ旧 Site からの unbind を欠いて
+        // いたため、stale な p が A に残り {p,q,r}=3 と過大計上されていた
+        let f = func_with_const(
+            &[("p", Some(false)), ("q", Some(false)), ("r", Some(false))],
+            vec![
+                (0, 3, heap()),
+                (1, 4, EventKind::AssignFromVar { src: VarId(0) }),
+                (0, 5, heap()),
+                (2, 6, EventKind::AssignFromVar { src: VarId(1) }),
+            ],
+            7,
+        );
+        let r = analyze(&f);
+        let m = &r.functions[0].metrics;
+        assert_eq!(
+            m.aliasing_pressure_max, 2,
+            "再確保で A から外れた p を数えてはいけない（stale なら3になる）"
+        );
+        assert_eq!(m.aliasing_pressure_sites, 1, "圧力2以上は Site A のみ");
+    }
+
+    #[test]
+    fn aliasing_pressure_addressof_realloc_unbinds_old_site() {
+        // AddressOf 再代入の unbind 漏れの回帰テスト（Heap 版と同一クラス）。
+        //   p = malloc(A); q = p;   // Site A: {p,q} → max=2
+        //   p = &x;                 // p は Borrow へ。A から p が外れること
+        //   r = q;                  // A に r 追加 → A は {q,r} の2
+        // 真の最大は2。Alloc の source が AddressOf でも旧束縛は終わるので、
+        // unbind を欠くと stale な p が A に残り {p,q,r}=3 と過大計上される
+        let f = func_with_const(
+            &[("p", Some(false)), ("q", Some(false)), ("r", Some(false))],
+            vec![
+                (0, 3, heap()),
+                (1, 4, EventKind::AssignFromVar { src: VarId(0) }),
+                (
+                    0,
+                    5,
+                    EventKind::Alloc {
+                        source: AllocSource::AddressOf,
+                    },
+                ),
+                (2, 6, EventKind::AssignFromVar { src: VarId(1) }),
+            ],
+            7,
+        );
+        let r = analyze(&f);
+        let m = &r.functions[0].metrics;
+        assert_eq!(
+            m.aliasing_pressure_max, 2,
+            "&x 再代入で A から外れた p を数えてはいけない（stale なら3になる）"
+        );
+        assert_eq!(m.aliasing_pressure_sites, 1, "圧力2以上は Site A のみ");
     }
 }

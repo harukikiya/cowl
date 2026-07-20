@@ -294,7 +294,7 @@ fn write_metric_cards(h: &mut String, m: &Metrics) {
 <div class="card"><div class="k">平均生存区間</div><div class="v">{:.1}行</div></div>
 <div class="card"><div class="k">移譲密度</div><div class="v">{:.1}/KLOC</div></div>
 <div class="card{}"><div class="k">別名圧力（最大）</div><div class="v">{}</div></div>
-<div class="card"><div class="k">圧力2以上の Site 数</div><div class="v">{}</div></div>
+<div class="card"><div class="k">圧力2以上のサイト数</div><div class="v">{}</div></div>
 <div class="card"><div class="k">別名不明束縛数</div><div class="v">{}</div></div>
 </div>
 "#,
@@ -384,8 +384,8 @@ mod tests {
             "新指標「別名圧力（最大）」ラベルが出力に含まれるべき"
         );
         assert!(
-            html.contains("圧力2以上の Site 数"),
-            "新指標「圧力2以上の Site 数」ラベルが出力に含まれるべき"
+            html.contains("圧力2以上のサイト数"),
+            "新指標「圧力2以上のサイト数」ラベルが出力に含まれるべき"
         );
         assert!(
             html.contains("別名不明束縛数"),
