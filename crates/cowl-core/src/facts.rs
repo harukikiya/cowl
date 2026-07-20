@@ -22,7 +22,8 @@ use serde::{Deserialize, Serialize};
 
 /// facts スキーマのバージョン。
 /// 互換性が壊れる変更（フィールド削除・意味変更）ではメジャーを上げる。
-pub const FACTS_SCHEMA_VERSION: &str = "0.1.0";
+/// 0.2.0: VarDecl に pointee_const を追加（ADR-0009 W6-1）。追加のみなのでマイナー
+pub const FACTS_SCHEMA_VERSION: &str = "0.2.0";
 
 /// ソース上の位置。行・列とも **1始まり**（エディタ表示と揃えるため）。
 /// tree-sitter は0始まりの row/column を返すので、フロントエンド側で +1 する。
@@ -95,6 +96,18 @@ pub struct VarDecl {
     pub id: VarId,
     pub name: String,
     pub decl: Span,
+    /// 宣言型における **pointee** の const 修飾（構文事実。ADR-0009）。
+    /// `const char *p` → Some(true)、`char *p` → Some(false)。
+    /// `char * const p`（ポインタ自身の const）は pointee の話ではないので
+    /// ここには反映しない（測るのは常に「指す先」の修飾だけ）。
+    /// None は「測れなかった」の自己申告（例: typedef 越しで中身を見通せない）。
+    /// unknowns には重複記録しない — Option 自体が曖昧さの表現であるため。
+    /// あくまで構文上の const 有無という事実であり、そこから「書込可能か」を
+    /// 導く解釈は analysis 層の仕事（facts firewall）。
+    /// `#[serde(default)]` は 0.1.0 時代の JSON（このフィールドが無い）を
+    /// 読み込んだときに None へ後方互換で落とすため
+    #[serde(default)]
+    pub pointee_const: Option<bool>,
 }
 
 /// 変数に対して観測された1イベント

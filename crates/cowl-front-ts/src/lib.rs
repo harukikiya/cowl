@@ -212,6 +212,8 @@ struct PendingDecl<'t> {
     init: Option<Node<'t>>,
     /// 関数引数由来か（引数は「呼び出し元由来の不透明な値」として扱う）
     is_param: bool,
+    /// pointee の const 修飾（ADR-0009 / W6-1）。pointee_const_of の結果をそのまま持つ
+    pointee_const: Option<bool>,
 }
 
 fn extract_function(fn_node: Node, src: &str) -> Option<FunctionFacts> {
@@ -252,6 +254,9 @@ fn extract_function(fn_node: Node, src: &str) -> Option<FunctionFacts> {
                 byte: p.start_byte(),
                 init: None,
                 is_param: true,
+                // parameter_declaration ノード自身が _declaration_specifiers を
+                // 直接展開して持つ（declaration と同型）ので p をそのまま渡せる
+                pointee_const: pointee_const_of(p, src),
             });
         }
     }
@@ -262,6 +267,10 @@ fn extract_function(fn_node: Node, src: &str) -> Option<FunctionFacts> {
     let mut decl_nodes = Vec::new();
     collect_kind(body, "declaration", &mut decl_nodes);
     for d in decl_nodes {
+        // `const char *p, *q;` のように1つの declaration に複数の declarator が
+        // ぶら下がることがあるが、宣言指定子列（const の有無）は declaration
+        // ノード全体で共有されるので、内側のループの前に1回だけ判定する
+        let pointee_const = pointee_const_of(d, src);
         for i in 0..d.named_child_count() {
             let Some(c) = d.named_child(i) else { continue };
             match c.kind() {
@@ -281,6 +290,7 @@ fn extract_function(fn_node: Node, src: &str) -> Option<FunctionFacts> {
                         byte: c.start_byte(),
                         init: c.child_by_field_name("value"),
                         is_param: false,
+                        pointee_const,
                     });
                 }
                 "pointer_declarator" => {
@@ -294,6 +304,7 @@ fn extract_function(fn_node: Node, src: &str) -> Option<FunctionFacts> {
                         byte: c.start_byte(),
                         init: None,
                         is_param: false,
+                        pointee_const,
                     });
                 }
                 _ => {}
@@ -337,6 +348,7 @@ fn extract_function(fn_node: Node, src: &str) -> Option<FunctionFacts> {
             id: VarId(i as u32),
             name: p.name.clone(),
             decl: p.name_span,
+            pointee_const: p.pointee_const,
         })
         .collect();
     let name_to_id: HashMap<String, VarId> = vars.iter().map(|v| (v.name.clone(), v.id)).collect();
@@ -448,6 +460,43 @@ fn extract_function(fn_node: Node, src: &str) -> Option<FunctionFacts> {
         events: evs.into_iter().map(|(_, e)| e).collect(),
         unknowns,
     })
+}
+
+/// 宣言指定子列（`declaration` / `parameter_declaration` ノード）から
+/// pointee の const 修飾を判定する（ADR-0009 / W6-1）。
+///
+/// tree-sitter-c の文法上、`_declaration_specifiers`（型修飾子列＋型指定子）は
+/// 隠しルールとして `declaration`/`parameter_declaration` に直接展開される
+/// （node-types.json 上は現れない）。そのため「最初の `*` より前」にある
+/// const は、declarator（pointer_declarator 以下）に潜らない**直接の子**の
+/// type_qualifier として現れる — `const char *p` でも `char const *p` でも
+/// 同じ形になる。一方 `char * const p`（ポインタ自身の const）の
+/// type_qualifier は pointer_declarator の子（`*` の後ろ）に現れるので、
+/// 直接の子しか見ないこの判定には入ってこない（意図的な区別。ADR参照）。
+///
+/// 判定順:
+///   直接の子に type_qualifier "const" がある → Some(true)（typedef併用でも
+///   明示 const は確実に効くので typedef 解決の要否と無関係に確定できる）
+///   無く、型指定子が type_identifier（typedef名）→ None（中身を見通せない。
+///   L2はtypedefを解決できるため一部がSomeに変わる＝W5と同型の精度向上）
+///   どちらでもない（primitive_type/struct_specifier等が可視）→ Some(false)
+fn pointee_const_of(specifiers_node: Node, src: &str) -> Option<bool> {
+    let mut is_typedef_name = false;
+    for i in 0..specifiers_node.named_child_count() {
+        let Some(c) = specifiers_node.named_child(i) else {
+            continue;
+        };
+        match c.kind() {
+            "type_qualifier" if text(c, src) == "const" => return Some(true),
+            "type_identifier" => is_typedef_name = true,
+            _ => {}
+        }
+    }
+    if is_typedef_name {
+        None
+    } else {
+        Some(false)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1317,5 +1366,60 @@ void f(void) {
             "issues: {:?}",
             fr.issues
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // W6-1 (ADR-0009): VarDecl.pointee_const — 宣言型 pointee の const 修飾。
+    // 別名圧力（Aliasing Pressure）指標の測定材料であり、指標本体（analysis）は
+    // 別タスク。ここでは「測定が正しいか」だけを固定する
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn pointee_const_true_for_const_pointee() {
+        // 宣言指定子列（最初の`*`より前）にconstがあれば Some(true)
+        let f = extract_source("void f(void) { const char *p = 0; }", "t.c").unwrap();
+        assert_eq!(f.functions[0].vars[0].pointee_const, Some(true));
+    }
+
+    #[test]
+    fn pointee_const_false_for_plain_pointer() {
+        // constが無く、型指定子(primitive_type)も可視なので Some(false) と断定できる
+        let f = extract_source("void f(void) { char *p = 0; }", "t.c").unwrap();
+        assert_eq!(f.functions[0].vars[0].pointee_const, Some(false));
+    }
+
+    #[test]
+    fn pointee_const_ignores_pointer_self_const() {
+        // `char * const p` はポインタ自身のconstであり、pointeeの書込可能性とは
+        // 無関係（ADR-0009: この指標が見るのはpointee側だけ）。文法上
+        // type_qualifier が pointer_declarator の子（`*` の後ろ）に現れるため、
+        // 宣言指定子列（declarationの直接の子）だけを見るpointee_const_ofには
+        // そもそも入ってこない
+        let f = extract_source("void f(void) { char * const p = 0; }", "t.c").unwrap();
+        assert_eq!(f.functions[0].vars[0].pointee_const, Some(false));
+    }
+
+    #[test]
+    fn pointee_const_none_through_typedef() {
+        // 型指定子が type_identifier（typedef名 `cstr`）だと、tree-sitterの
+        // 構文情報だけでは中身（実体がconstかどうか）を見通せない。
+        // Some(false)と誤って断定するより、測れなかったことをNoneで自己申告する
+        // のがADR-0009の方針（L2/libclangは型を解決できるので一部がSomeに変わる。
+        // cowl-front-clang の pointee_const_resolves_through_typedef が対）
+        let f = extract_source("typedef char cstr; void f(void) { cstr *p = 0; }", "t.c").unwrap();
+        assert_eq!(f.functions[0].vars[0].pointee_const, None);
+    }
+
+    #[test]
+    fn pointee_const_measured_for_parameters() {
+        // 仮引数もローカル変数と同じ規則（宣言指定子列の直接の子を見る）で
+        // 測定される。parameter_declaration が declaration と同型に
+        // _declaration_specifiers を直接展開するという文法上の性質による
+        let f = extract_source("void f(const char *p, char *q) {}", "t.c").unwrap();
+        let ff = &f.functions[0];
+        assert_eq!(ff.vars[0].name, "p");
+        assert_eq!(ff.vars[0].pointee_const, Some(true));
+        assert_eq!(ff.vars[1].name, "q");
+        assert_eq!(ff.vars[1].pointee_const, Some(false));
     }
 }

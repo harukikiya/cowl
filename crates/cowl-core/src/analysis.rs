@@ -978,6 +978,9 @@ mod tests {
                         id: VarId(i as u32),
                         name: (*n).into(),
                         decl: Span::line(2),
+                        // W6-1機械的追随: このテストビルダは pointee_const を
+                        // 検証対象にしていないため None で固定する（アサーション不変）
+                        pointee_const: None,
                     })
                     .collect(),
                 events: events

@@ -148,6 +148,8 @@ struct PendingDecl<'tu> {
     init: Option<Entity<'tu>>,
     /// 関数引数由来か
     is_param: bool,
+    /// pointee の const 修飾（ADR-0009 / W6-1）。pointee_const_of の結果をそのまま持つ
+    pointee_const: Option<bool>,
 }
 
 fn extract_function<'tu>(fn_entity: Entity<'tu>, src: &str) -> Option<FunctionFacts> {
@@ -175,6 +177,7 @@ fn extract_function<'tu>(fn_entity: Entity<'tu>, src: &str) -> Option<FunctionFa
             byte: start_offset_of(p),
             init: None,
             is_param: true,
+            pointee_const: pointee_const_of(p),
         });
     }
 
@@ -195,6 +198,7 @@ fn extract_function<'tu>(fn_entity: Entity<'tu>, src: &str) -> Option<FunctionFa
             byte: start_offset_of(d),
             init: var_init(d),
             is_param: false,
+            pointee_const: pointee_const_of(d),
         });
     }
 
@@ -234,6 +238,7 @@ fn extract_function<'tu>(fn_entity: Entity<'tu>, src: &str) -> Option<FunctionFa
             id: VarId(i as u32),
             name: p.name.clone(),
             decl: p.name_span,
+            pointee_const: p.pointee_const,
         })
         .collect();
     let tracked: HashMap<String, VarId> = vars.iter().map(|v| (v.name.clone(), v.id)).collect();
@@ -745,6 +750,24 @@ fn is_pointer_type(e: Entity<'_>) -> bool {
         .unwrap_or(false)
 }
 
+/// 宣言型 pointee の const 修飾（ADR-0009 / W6-1）。呼び出し元は
+/// is_pointer_type(e) が真であることを確認済みの Entity（引数 or VarDecl）を渡す前提。
+///
+/// `get_canonical_type()` を挟むのが要点: 宣言そのままの型（sugared type）に
+/// 直接 `is_const_qualified()` を呼ぶと、typedef の内側に const が隠れている
+/// ケース（`typedef const char cstr; cstr *p;`）で false を返してしまう
+/// （実測: pointee.display="cstr", is_const_qualified=false だが
+/// canonical.is_const_qualified=true）。canonicalize して初めて typedef の
+/// 定義まで見た判定になる。これが L1(構文のみ・typedefはNoneに倒す)に対する
+/// L2 の精度向上の核心（W5のconst規則実装と同系の「型を実際に解決する」設計）。
+/// 素の const/非const/ポインタ自身のconst（`char * const p`。pointeeには
+/// 効かない）は canonicalize してもしなくても結果が変わらないことも実測済みで、
+/// 常に canonical 側を使って一本化して問題ない
+fn pointee_const_of(e: Entity<'_>) -> Option<bool> {
+    let pointee = e.get_type()?.get_pointee_type()?;
+    Some(pointee.get_canonical_type().is_const_qualified())
+}
+
 /// VarDeclの初期化式を取り出す。
 /// `clang_Cursor_getVarDeclInitializer` は libclang 12.0 以降限定かつ
 /// 安全ラッパの `clang` クレートが公開していないため使わず、
@@ -978,6 +1001,18 @@ mod tests {
             let names1: Vec<&str> = ff1.vars.iter().map(|v| v.name.as_str()).collect();
             let names2: Vec<&str> = ff2.vars.iter().map(|v| v.name.as_str()).collect();
             assert_eq!(names1, names2, "追跡変数の並びが一致しない: {}", ff1.name);
+
+            // W6-1 (ADR-0009): pointee_const。この互換ゴールデン群のソースは
+            // どれもtypedefを含まない素朴な宣言なので、L1/L2で完全一致するはず
+            // （typedef越しの精度向上でL1=None/L2=Someに分かれるケースは対象外。
+            // それは pointee_const_resolves_through_typedef で別途固定する）
+            let pc1: Vec<Option<bool>> = ff1.vars.iter().map(|v| v.pointee_const).collect();
+            let pc2: Vec<Option<bool>> = ff2.vars.iter().map(|v| v.pointee_const).collect();
+            assert_eq!(
+                pc1, pc2,
+                "pointee_constがL1/L2で一致しない: {}\nL1={:?}\nL2={:?}",
+                ff1.name, ff1.vars, ff2.vars
+            );
 
             let s1: Vec<(VarId, Shape)> = ff1
                 .events
@@ -1309,6 +1344,42 @@ void f(void) {
                 }
             )
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // 精度向上テスト (c) pointee_const の typedef 解決（W6-1 / ADR-0009）
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn pointee_const_resolves_through_typedef() {
+        // L1: 宣言指定子列に見えるのは type_identifier（typedef名 `cstr`）だけで、
+        //     その中身が const かどうかは構文情報だけでは分からないので None
+        //     （cowl-front-ts::tests::pointee_const_none_through_typedef と対）
+        // L2: libclangは型を実際に解決できる。`get_type()`で得られる宣言そのまま
+        //     の型（sugared）に直接 is_const_qualified() を呼ぶと、const が
+        //     typedef の中に隠れているケースでは false を返してしまう
+        //     （スパイクで実測: pointee.display="cstr" は sugared のまま）。
+        //     get_canonical_type() を挟んで初めて `cstr` = `const char` という
+        //     定義まで見た判定になり、Some(true) に解決する。
+        //     これは const ポインタ引数(W5, (b)節)と同型の「型を実際に解決する」
+        //     精度向上であり、L1/L2 どちらにも無かった新しい解釈の混入ではない
+        //
+        // 注: 元のtypedefは `typedef const char *cstr;`（cstr自体がポインタ型）
+        // ではなく `typedef const char cstr;`（ポインタの基底型だけをtypedef）
+        // にしている。前者を `cstr p;` のように*無しで使うと、L1(構文上
+        // pointer_declaratorが無い)もL2(is_pointer_typeがget_type()のkindを見る
+        // だけでtypedefを解決しない設計。モジュール冒頭コメント参照)も
+        // そもそもポインタ変数として追跡しない — 両者とも「追跡すらしない」で
+        // 一致してしまい、pointee_constの精度差というこのテストの主題を
+        // 検証できない。使用箇所に明示的な`*`を残す本形なら両方とも追跡対象になり、
+        // 差が pointee_const だけに絞り込める
+        let src = "typedef const char cstr; void f(void) { cstr *p = 0; }";
+
+        let f1 = cowl_front_ts::extract_source(src, "t.c").unwrap();
+        assert_eq!(f1.functions[0].vars[0].pointee_const, None);
+
+        let f2 = extract_source(src, "t.c").unwrap();
+        assert_eq!(f2.functions[0].vars[0].pointee_const, Some(true));
     }
 
     // -----------------------------------------------------------------------
