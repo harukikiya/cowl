@@ -206,3 +206,37 @@ impl Facts {
             .unwrap_or("")
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// facts は外部ツール（VSCode拡張・MCP経由で保存された旧 JSON 等）にも
+    /// 露出する契約なので、スキーマ進化の互換性はコメントの主張ではなく
+    /// テストで固定する。この1本が守っているのは AddressOf の
+    /// `#[serde(default)]` であり、これを外すと 0.2.0 以前の JSON が
+    /// パースエラーになる（facts-schema スキルが「追加＝マイナー」と
+    /// 分類できる根拠そのもの）。W8 の qa レビュー指摘（P1）で追加
+    #[test]
+    fn addressof_target_defaults_to_none_for_pre_0_3_0_json() {
+        let old_json = r#"{"kind":"address_of"}"#;
+        let parsed: AllocSource = serde_json::from_str(old_json).unwrap();
+        assert_eq!(parsed, AllocSource::AddressOf { target: None });
+    }
+
+    /// Some/None 両方の現行形がラウンドトリップで保存されること。
+    /// enum 表現方式（internally tagged）をうっかり変えた場合の検知網
+    #[test]
+    fn addressof_target_roundtrips() {
+        for src in [
+            AllocSource::AddressOf {
+                target: Some("x".into()),
+            },
+            AllocSource::AddressOf { target: None },
+        ] {
+            let json = serde_json::to_string(&src).unwrap();
+            let back: AllocSource = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, src);
+        }
+    }
+}

@@ -328,7 +328,7 @@ mod tests {
         assert!(res["error"].is_string());
     }
 
-    /// (d) examples/*.c 全7本が frontend:"clang" の render_html で ok:true。
+    /// (d) examples/*.c 全8本が frontend:"clang" の render_html で ok:true。
     /// 「両フロントエンドで examples が通る」証拠の L2 側
     /// （L1 側は既存テスト＋make demo が担う）。
     /// これは疎通の確認であって配線先の判別ではない
@@ -347,7 +347,8 @@ mod tests {
             .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("c"))
             .collect();
         files.sort();
-        assert_eq!(files.len(), 7, "examples/*.c の本数が想定と違う: {files:?}");
+        // 本数ゴールデン: examples の黙った増減を検知する（W8 で borrow_alias.c を追加し 7→8）
+        assert_eq!(files.len(), 8, "examples/*.c の本数が想定と違う: {files:?}");
 
         for path in files {
             let req = serde_json::json!({

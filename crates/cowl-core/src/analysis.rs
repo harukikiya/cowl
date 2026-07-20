@@ -2370,6 +2370,54 @@ mod tests {
     }
 
     #[test]
+    fn borrow_site_three_stage_chain_propagates() {
+        // W8 qa レビュー指摘（P2）の回帰テスト:
+        // p = &x; q = p; r = q; — AssignFromVar の伝播が2段目以降も
+        // 同じ借用 Site に届くこと（連鎖の一般性）を固定する
+        let f = func_with_const(
+            &[("p", Some(false)), ("q", Some(false)), ("r", Some(false))],
+            vec![
+                (0, 3, borrow_of(Some("x"))),
+                (1, 4, EventKind::AssignFromVar { src: VarId(0) }),
+                (2, 5, EventKind::AssignFromVar { src: VarId(1) }),
+            ],
+            6,
+        );
+        let r = analyze(&f);
+        let m = &r.functions[0].metrics;
+        assert_eq!(m.aliasing_pressure_max, 3, "3段連鎖で同一 Site に3束縛");
+        assert_eq!(m.aliasing_pressure_sites, 1);
+    }
+
+    #[test]
+    fn borrow_site_realloc_unbinds_old_site() {
+        // W8 qa レビュー指摘（P2）の回帰テスト。W6-4 の P0（Alloc 再代入で
+        // 旧 Site の unbind を忘れ stale が過大計上する）の借用 Site 版:
+        // p = &x; q = p;（Site(x) max=2）→ p = &y;（p は x から外れる）
+        // → r = q;（Site(x) は {q,r} の2）。stale の p が残ると 3 になる
+        let f = func_with_const(
+            &[("p", Some(false)), ("q", Some(false)), ("r", Some(false))],
+            vec![
+                (0, 3, borrow_of(Some("x"))),
+                (1, 4, EventKind::AssignFromVar { src: VarId(0) }),
+                (0, 5, borrow_of(Some("y"))),
+                (2, 6, EventKind::AssignFromVar { src: VarId(1) }),
+            ],
+            7,
+        );
+        let r = analyze(&f);
+        let m = &r.functions[0].metrics;
+        assert_eq!(
+            m.aliasing_pressure_max, 2,
+            "p の &y 再代入で Site(x) から p が外れ、真の最大2のまま"
+        );
+        assert_eq!(
+            m.aliasing_pressure_sites, 1,
+            "圧力2に達したのは Site(x) のみ"
+        );
+    }
+
+    #[test]
     fn borrow_and_heap_mixed_independence() {
         // W8-2: ヒープ Site と借用 Site が独立に計上される
         // p = malloc(); q = p; (heap site: max=2) + r = &x; s = &x; (borrow: max=2)

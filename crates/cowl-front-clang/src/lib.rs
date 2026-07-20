@@ -1457,7 +1457,8 @@ void f(void) {
             .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("c"))
             .collect();
         files.sort();
-        assert_eq!(files.len(), 7, "examples/*.c の本数が想定と違う: {files:?}");
+        // 本数ゴールデン: examples の黙った増減を検知する（W8 で borrow_alias.c を追加し 7→8）
+        assert_eq!(files.len(), 8, "examples/*.c の本数が想定と違う: {files:?}");
 
         for path in files {
             let facts = extract_file(path.to_str().unwrap())
