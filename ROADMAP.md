@@ -106,10 +106,23 @@
   判別力不足を配線バグ注入の変異実験で実証）→ 修正・再レビューで承認。
   claude ワーカー実装＋qa-reviewer 承認
 
-## W8: AddressOf 別名の Site 化（facts 拡張）
+## W8: AddressOf 別名の Site 化（facts 拡張） [x]
 - 内容: AllocSource::AddressOf に取得元識別子を追加し、`&x` 由来の借用別名も
   別名圧力の対象 Site にする（ADR-0009 で Heap に縮小した対象の解除）
 - 受け入れ: facts-schema 3点セット / 同一取得元への `&x` 2箇所が同一 Site に
   束ねられることをテストで固定 / L1・L2 両フロント同期
 - 備考: W6 の qa レビューで判明した原理的制約（unit variant に識別情報が無い）
   への対応。優先度は低（スタック別名の圧力はヒープより実害が小さい）
+- [x] 完了 (2026-07-20): 09dfc0b+09b5f89+a0cb6d8 — facts 0.3.0
+  （AddressOf{target}: 単純識別子のみ Some、複合式は None。L1/L2 が同一の
+  構文規則＝Site の切り方の互換維持。ADR-0010）、report 0.4.0（借用 Site を
+  ヒープの sites 配列と独立に追跡し圧力3指標へ合流。同一 target 束ね・
+  AssignFromVar 伝播・8経路の対称 unbind。既存診断と既存指標は worktree
+  diff で 1 ビット不変を実証）。qa 差し戻し1回: serde 後方互換テスト皆無
+  （P1）→ facts.rs に tests 新設。qa の変異実験で「Option 欠落キーは
+  #[serde(default)] なしでも None」という serde 仕様が判明し、W6-1 以来の
+  doc コメントの因果誤りを是正。借用版 stale 回帰・3段連鎖テストも追加。
+  examples/borrow_alias.c を新設（& を使う初の example。借用圧力2で warn、
+  const 借用は数えない、を demo で可視化。本数ゴールデン 7→8）。
+  frontend/analysis 両ワーカー実装＋qa-reviewer 承認（テスト転記のみ
+  オーケストレータ代行）

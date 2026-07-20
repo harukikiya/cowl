@@ -42,7 +42,7 @@ cowl-mcp ──┘             cowl-front-clang ──┘
 
 - 詳細な規約とレイヤ責務: **CLAUDE.md**（プロジェクト憲法）
 - 設計判断: docs/adr/
-- 今後のタスク: ROADMAP.md（W6: 別名圧力 …）
+- 今後のタスク: ROADMAP.md 参照（W1〜W8 は完了済み。次のタスクはここに起票する）
 
 ## 何が見えるか（examples/demo.c）
 

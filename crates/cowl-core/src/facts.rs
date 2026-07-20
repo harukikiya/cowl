@@ -105,8 +105,10 @@ pub struct VarDecl {
     /// unknowns には重複記録しない — Option 自体が曖昧さの表現であるため。
     /// あくまで構文上の const 有無という事実であり、そこから「書込可能か」を
     /// 導く解釈は analysis 層の仕事（facts firewall）。
-    /// `#[serde(default)]` は 0.1.0 時代の JSON（このフィールドが無い）を
-    /// 読み込んだときに None へ後方互換で落とすため
+    /// 0.1.0 時代の JSON（このフィールドが無い）は None に落ちて後方互換。
+    /// その実体は serde が `Option<T>` の欠落キーを属性なしでも None に
+    /// 解決する仕様であり（W8 qa の最小再現で確認）、`#[serde(default)]` は
+    /// 「欠落を許す設計である」ことの明示（保険）として付けている
     #[serde(default)]
     pub pointee_const: Option<bool>,
 }
@@ -172,8 +174,9 @@ pub enum AllocSource {
         /// 自己申告する（Unknown への重複記録はしない。ADR-0009と同じ扱い）。
         /// target を「同じ変数への借用として束ねてよいか」の解釈は
         /// analysis 層の仕事（facts firewall）。
-        /// `#[serde(default)]` は 0.2.0 以前の JSON（このフィールドが無い）を
-        /// 読み込んだときに None へ後方互換で落とすため
+        /// 0.2.0 以前の JSON（このフィールドが無い）は None に落ちて後方互換。
+        /// 実体は serde の「`Option<T>` の欠落キーは属性なしでも None」仕様で、
+        /// `#[serde(default)]` は設計意図の明示（保険）。pointee_const と同じ扱い
         #[serde(default)]
         target: Option<String>,
     },
@@ -213,10 +216,13 @@ mod tests {
 
     /// facts は外部ツール（VSCode拡張・MCP経由で保存された旧 JSON 等）にも
     /// 露出する契約なので、スキーマ進化の互換性はコメントの主張ではなく
-    /// テストで固定する。この1本が守っているのは AddressOf の
-    /// `#[serde(default)]` であり、これを外すと 0.2.0 以前の JSON が
-    /// パースエラーになる（facts-schema スキルが「追加＝マイナー」と
-    /// 分類できる根拠そのもの）。W8 の qa レビュー指摘（P1）で追加
+    /// テストで固定する。この1本が守る観測可能な契約は「0.2.0 形の JSON が
+    /// target:None に落ちる」こと。その実体は serde の Option 欠落時 None
+    /// 仕様であり `#[serde(default)]` の有無ではない（qa の変異実験で属性を
+    /// 外しても互換が保たれることを確認済み）が、将来 target の型を
+    /// Option 以外へ変える・enum 表現方式を変える等の回帰はこのテストが
+    /// 検知する（facts-schema スキルが「追加＝マイナー」と分類できる根拠）。
+    /// W8 の qa レビュー指摘（P1）で追加
     #[test]
     fn addressof_target_defaults_to_none_for_pre_0_3_0_json() {
         let old_json = r#"{"kind":"address_of"}"#;
