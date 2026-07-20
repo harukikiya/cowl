@@ -345,6 +345,7 @@ mod tests {
             transfers_total: 31,
             lines_analyzed: 1000,
             transfer_density: 31.0,
+            ..Default::default()
         };
         let report = make_test_report_with_metrics(metrics);
         let html = render_html(&facts, &report);
@@ -387,6 +388,7 @@ mod tests {
             transfers_total: 31,
             lines_analyzed: 1000,
             transfer_density: 31.0,
+            ..Default::default()
         };
         let report_warn = make_test_report_with_metrics(metrics_warn);
         let html_warn = render_html(&facts, &report_warn);
@@ -417,6 +419,7 @@ mod tests {
             transfers_total: 31,
             lines_analyzed: 1000,
             transfer_density: 31.0,
+            ..Default::default()
         };
         let report_no_warn = make_test_report_with_metrics(metrics_no_warn);
         let html_no_warn = render_html(&facts, &report_no_warn);

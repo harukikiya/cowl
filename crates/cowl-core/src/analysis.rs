@@ -31,7 +31,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 /// 解析レポートのスキーマバージョン（factsとは独立に進化する）
 /// 0.2.0: Free-Site Multiplicity、Live-Range Length、Transfer Density の3指標を追加（フィールド追加のみ）
-pub const REPORT_SCHEMA_VERSION: &str = "0.2.0";
+/// 0.3.0: Aliasing Pressure（別名圧力）の3指標を追加（フィールド追加のみ）
+pub const REPORT_SCHEMA_VERSION: &str = "0.3.0";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Report {
@@ -197,6 +198,38 @@ pub struct Metrics {
     pub lines_analyzed: u32,
     /// transfers_total / (lines_analyzed / 1000)（分母0のとき0.0）
     pub transfer_density: f64,
+
+    // --- 指標第3陣（ADR-0009）---
+    /// **Aliasing Pressure Maximum** (別名圧力の最大値)
+    /// 意図: 「同じリソースに同時に書き込める名前が複数ある」状態は
+    ///       Rust の借用規則が禁じる排他性違反に相当し、追跡難度と
+    ///       リファクタリング時の退行リスクが高い
+    /// 分子・分母: 全 Site にわたって「その Site に同時に生存した
+    ///       書込可能な束縛（Var）数」の最大値を取ったもの
+    /// 分母0のとき: 0 （ヒープ確保なし。理想値）
+    /// 相関仮説: 別名圧力が2以上の Site ほど、use-after-free や
+    ///       データ競争（将来のマルチスレッド対応）のリスクが高いはず
+    pub aliasing_pressure_max: u32,
+
+    /// **Aliasing Pressure Sites** (圧力2以上の Site 数)
+    /// 意図: 「書き込み別名がある」という状態にある Site の数を測る。
+    ///       カバレッジ指標と並べて「どの程度危ないのか」を定量化する
+    /// 分子: 「同時最大書込可能束縛数が2以上」の Site 数
+    /// 分母0のとき: 0 （理想状態）
+    /// 相関仮説: 圧力 Site 数が多いほど、全体の所有権複雑性が高く、
+    ///       設計見直しのターゲットになるはず
+    pub aliasing_pressure_sites: u32,
+
+    /// **Aliasing Unknown Bindings** (測定不能な別名束縛数)
+    /// 意図: pointee_const = None の Var による束縛をカウント。
+    ///       「測れなかった」ことを可視化し、L2/L3 で優先的に
+    ///       解決すべき箇所のシグナルにする
+    /// 分子: pointee_const が None のまま束縛が生存した Var-Site 対の
+    ///       総数（時系列集計。同一対が複数回生存すれば複数回カウント）
+    /// 分母0のとき: 0 （すべて測定可能。理想値）
+    /// 相関仮説: unknown が少ないほど、L1 の構文解析だけで十分に
+    ///       信頼度の高い解析ができる（L2 導入の効果も測れる）
+    pub aliasing_unknown_bindings: u32,
 }
 
 impl Metrics {
@@ -255,6 +288,10 @@ impl Metrics {
         self.live_range_lines_total += other.live_range_lines_total;
         self.transfers_total += other.transfers_total;
         self.lines_analyzed += other.lines_analyzed;
+        // 指標第3陣の集計：最大値は max() で、件数は加算
+        self.aliasing_pressure_max = self.aliasing_pressure_max.max(other.aliasing_pressure_max);
+        self.aliasing_pressure_sites += other.aliasing_pressure_sites;
+        self.aliasing_unknown_bindings += other.aliasing_unknown_bindings;
     }
 }
 
@@ -365,6 +402,14 @@ struct SiteState {
     /// 複数回遷移のケース（同じポインタが2箇所で return される等）も存在するため
     /// 回数をカウント。これは「移譲の複雑さ」を測る指標値
     transfer_count: u32,
+
+    // --- 別名圧力指標用 ---
+    /// 現在この Site に束縛されている Var → その Var の pointee_const
+    /// 束縛の開始・終了とともに更新される
+    current_bindings: BTreeMap<VarId, Option<bool>>,
+    /// このサイトで観測された「同時に生存した書込可能束縛の最大数」
+    /// 書込可能 = pointee_const が Some(false) の束縛
+    aliasing_pressure_at_site: u32,
 }
 
 /// 解析エントリポイント：facts 全体 → Report
@@ -444,6 +489,54 @@ fn analyze_function(f: &FunctionFacts) -> FunctionReport {
         }
     };
 
+    // 別名圧力指標の計上ヘルパー群
+    // Site への束縛を開始する。pointee_const が None なら unknown をカウント
+    let bind_to_site = |sites: &mut Vec<SiteState>,
+                        site_id: SiteId,
+                        var_id: VarId,
+                        pointee_const: Option<bool>,
+                        metrics: &mut Metrics| {
+        let ss = &mut sites[site_id.0 as usize];
+        ss.current_bindings.insert(var_id, pointee_const);
+        if pointee_const.is_none() {
+            metrics.aliasing_unknown_bindings += 1;
+        }
+    };
+
+    // Site からの束縛を解除する。
+    let unbind_from_site = |sites: &mut Vec<SiteState>, site_id: SiteId, var_id: VarId| {
+        let ss = &mut sites[site_id.0 as usize];
+        ss.current_bindings.remove(&var_id);
+    };
+
+    // Site の現在の書込可能束縛を数え、最大値を更新する。
+    // Site が Live の間のみカウント（Freed/Moved/Escaped後は圧力を数えない）。
+    // 返り値：true なら最大値が初めて2以上に達した（aliasing_pressure_sites のカウント対象）
+    let update_aliasing_pressure =
+        |sites: &mut Vec<SiteState>, site_id: SiteId, metrics: &mut Metrics| -> bool {
+            let ss = &mut sites[site_id.0 as usize];
+            // Site が Live でなければ、生存中の束縛の圧力をカウントしない
+            // （解放後の dangling 別名は既存の use_after_free 診断に任せる）
+            if !matches!(ss.life, SiteLife::Live) {
+                return false;
+            }
+            // 現在の書込可能束縛数を数える（pointee_const = Some(false) のみ）
+            let writable_count = ss
+                .current_bindings
+                .values()
+                .filter(|pc| matches!(pc, Some(false)))
+                .count() as u32;
+            // 最大値を更新
+            let old_pressure = ss.aliasing_pressure_at_site;
+            ss.aliasing_pressure_at_site = ss.aliasing_pressure_at_site.max(writable_count);
+            // グローバル最大値を更新
+            metrics.aliasing_pressure_max = metrics
+                .aliasing_pressure_max
+                .max(ss.aliasing_pressure_at_site);
+            // 最大値が初めて2以上に達した場合は true を返す
+            old_pressure < 2 && ss.aliasing_pressure_at_site >= 2
+        };
+
     // 全変数のフェーズを再計算し、変化した変数のセグメントを line で切り替える。
     // 「イベントの行から新フェーズが始まる」規約（確保行はもうOwned色で塗る）
     macro_rules! commit_phases {
@@ -516,6 +609,9 @@ fn analyze_function(f: &FunctionFacts) -> FunctionReport {
                     AllocSource::Heap { func } => {
                         let sid = SiteId(site_seq);
                         site_seq += 1;
+                        // Var の pointee_const を取得（このアロケーションで束縛する変数から）
+                        let pointee_const = f.vars[vi].pointee_const;
+                        // 新しい Site を作成（束縛は bind_to_site で追加する）
                         sites.push(SiteState {
                             life: SiteLife::Live,
                             ambiguous: false,
@@ -524,7 +620,22 @@ fn analyze_function(f: &FunctionFacts) -> FunctionReport {
                             free_lines: BTreeSet::new(),
                             last_event_line: line,
                             transfer_count: 0,
+                            current_bindings: BTreeMap::new(),
+                            aliasing_pressure_at_site: 0,
                         });
+                        // 最初の束縛を追加し、unknown カウント
+                        bind_to_site(
+                            &mut sites,
+                            sid,
+                            VarId(vi as u32),
+                            pointee_const,
+                            &mut metrics,
+                        );
+                        // 圧力を更新（最初の束縛なので通常 Site 圧力は1だが、念のため呼び出す）
+                        if update_aliasing_pressure(&mut sites, sid, &mut metrics) {
+                            metrics.aliasing_pressure_sites += 1;
+                        }
+
                         bindings[vi] = Binding::Site {
                             site: sid,
                             owner: true,
@@ -560,12 +671,32 @@ fn analyze_function(f: &FunctionFacts) -> FunctionReport {
 
             EventKind::AssignFromVar { src } => {
                 let si = src.0 as usize;
+                // 代入前に、既存の束縛を解除する（もし存在すれば）
+                if let Binding::Site { site: old_site, .. } = bindings[vi] {
+                    unbind_from_site(&mut sites, old_site, VarId(vi as u32));
+                    if update_aliasing_pressure(&mut sites, old_site, &mut metrics) {
+                        metrics.aliasing_pressure_sites += 1;
+                    }
+                }
+
                 match bindings[si] {
                     Binding::Site { site, .. } => {
                         // L1では「別名」として扱う（ムーブ断定はしない）。
                         // 所有の所在が2箇所になった時点で Site は曖昧マーク。
                         // ※ ここが将来 L2/L3 で「src以後未使用ならムーブ」等に
                         //   精緻化される拡張ポイント
+                        let pointee_const = f.vars[vi].pointee_const;
+                        bind_to_site(
+                            &mut sites,
+                            site,
+                            VarId(vi as u32),
+                            pointee_const,
+                            &mut metrics,
+                        );
+                        if update_aliasing_pressure(&mut sites, site, &mut metrics) {
+                            metrics.aliasing_pressure_sites += 1;
+                        }
+
                         bindings[vi] = Binding::Site { site, owner: false };
                         sites[site.0 as usize].ambiguous = true;
                         graph.edges.push(GEdge {
@@ -584,6 +715,13 @@ fn analyze_function(f: &FunctionFacts) -> FunctionReport {
             EventKind::AssignNull => {
                 // free 後の NULL 代入は良い作法：ダングリングが解消される。
                 // だからこそ Null を独立フェーズとして持つ価値がある
+                // 既存の束縛を解除（圧力に影響）
+                if let Binding::Site { site, .. } = bindings[vi] {
+                    unbind_from_site(&mut sites, site, VarId(vi as u32));
+                    if update_aliasing_pressure(&mut sites, site, &mut metrics) {
+                        metrics.aliasing_pressure_sites += 1;
+                    }
+                }
                 bindings[vi] = Binding::Null;
             }
 
@@ -596,6 +734,11 @@ fn analyze_function(f: &FunctionFacts) -> FunctionReport {
                             vname.clone(),
                             "所有中の資源を解放せずに上書きしています（リーク疑い）".into()
                         );
+                    }
+                    // 既存の束縛を解除（圧力に影響）
+                    unbind_from_site(&mut sites, site, VarId(vi as u32));
+                    if update_aliasing_pressure(&mut sites, site, &mut metrics) {
+                        metrics.aliasing_pressure_sites += 1;
                     }
                 }
                 // 由来不明の値は以後追跡不能。free されても正当性を判断できない
@@ -656,6 +799,11 @@ fn analyze_function(f: &FunctionFacts) -> FunctionReport {
                         match ss.life {
                             SiteLife::Live => {
                                 ss.life = SiteLife::Freed { line };
+                                // 束縛を解除（Site の生存終了）
+                                unbind_from_site(&mut sites, site, VarId(vi as u32));
+                                if update_aliasing_pressure(&mut sites, site, &mut metrics) {
+                                    metrics.aliasing_pressure_sites += 1;
+                                }
                                 graph.edges.push(GEdge {
                                     from: format!("v{}", vi),
                                     to: format!("s{}", site.0),
@@ -741,6 +889,11 @@ fn analyze_function(f: &FunctionFacts) -> FunctionReport {
                         ss.transfer_count += 1;
                         // 指標「Live-Range Length」用：最後のイベント行を更新
                         ss.last_event_line = line;
+                        // 束縛を解除（Site の生存終了）
+                        unbind_from_site(&mut sites, site, VarId(vi as u32));
+                        if update_aliasing_pressure(&mut sites, site, &mut metrics) {
+                            metrics.aliasing_pressure_sites += 1;
+                        }
                         graph.edges.push(GEdge {
                             from: format!("v{}", vi),
                             to: "outside".into(),
@@ -802,6 +955,11 @@ fn analyze_function(f: &FunctionFacts) -> FunctionReport {
                     ss.transfer_count += 1;
                     // 指標「Live-Range Length」用：最後のイベント行を更新
                     ss.last_event_line = line;
+                    // 束縛を解除（Site の生存終了）
+                    unbind_from_site(&mut sites, site, VarId(vi as u32));
+                    if update_aliasing_pressure(&mut sites, site, &mut metrics) {
+                        metrics.aliasing_pressure_sites += 1;
+                    }
                     graph.edges.push(GEdge {
                         from: format!("v{}", vi),
                         to: "outside".into(),
@@ -827,6 +985,11 @@ fn analyze_function(f: &FunctionFacts) -> FunctionReport {
                     ss.transfer_count += 1;
                     // 指標「Live-Range Length」用：最後のイベント行を更新
                     ss.last_event_line = line;
+                    // 束縛を解除（Site の生存終了）
+                    unbind_from_site(&mut sites, site, VarId(vi as u32));
+                    if update_aliasing_pressure(&mut sites, site, &mut metrics) {
+                        metrics.aliasing_pressure_sites += 1;
+                    }
                     graph.edges.push(GEdge {
                         from: format!("v{}", vi),
                         to: "outside".into(),
@@ -1001,6 +1164,48 @@ mod tests {
             source: AllocSource::Heap {
                 func: "malloc".into(),
             },
+        }
+    }
+
+    /// テスト用の facts ビルダ（pointee_const 対応）。変数ごとに const 指定を指定できる
+    /// vars_with_const: (var_name, pointee_const) のペア
+    fn func_with_const(
+        vars_with_const: &[(&str, Option<bool>)],
+        events: Vec<(u32, u32, EventKind)>,
+        end: u32,
+    ) -> Facts {
+        Facts {
+            schema_version: FACTS_SCHEMA_VERSION.into(),
+            file: "test.c".into(),
+            source: String::new(),
+            functions: vec![FunctionFacts {
+                name: "f".into(),
+                span: Span {
+                    line_start: 1,
+                    line_end: end,
+                    col_start: 1,
+                    col_end: 1,
+                },
+                vars: vars_with_const
+                    .iter()
+                    .enumerate()
+                    .map(|(i, (n, pc))| VarDecl {
+                        id: VarId(i as u32),
+                        name: (*n).into(),
+                        decl: Span::line(2),
+                        pointee_const: *pc,
+                    })
+                    .collect(),
+                events: events
+                    .into_iter()
+                    .map(|(v, l, k)| Event {
+                        var: VarId(v),
+                        span: Span::line(l),
+                        kind: k,
+                    })
+                    .collect(),
+                unknowns: vec![],
+            }],
         }
     }
 
@@ -1577,5 +1782,152 @@ mod tests {
         assert_eq!(m.transfers_total, 0);
         assert_eq!(m.lines_analyzed, 0);
         assert_eq!(m.transfer_density, 0.0, "分母0の場合 0.0");
+    }
+
+    // --- 指標第3陣のテスト（ADR-0009：別名圧力） ---
+
+    #[test]
+    fn aliasing_pressure_no_heap() {
+        // ヒープ確保なし → aliasing_pressure_max=0, sites=0, unknown=0
+        let f = func_with_const(&[("p", Some(false))], vec![], 10);
+        let r = analyze(&f);
+        let m = &r.functions[0].metrics;
+        assert_eq!(m.aliasing_pressure_max, 0, "ヒープなしなら圧力0");
+        assert_eq!(m.aliasing_pressure_sites, 0);
+        assert_eq!(m.aliasing_unknown_bindings, 0);
+    }
+
+    #[test]
+    fn aliasing_pressure_single_ownership() {
+        // p = malloc(); use(p); free(p);
+        // pointee_const=Some(false)（書込可能）だが、単独所有なので圧力1
+        // 圧力1は「正常」であり Site には数えない（2以上のみ）
+        let f = func_with_const(
+            &[("p", Some(false))],
+            vec![
+                (0, 3, heap()),
+                (
+                    0,
+                    4,
+                    EventKind::Use {
+                        mode: UseMode::Write,
+                    },
+                ),
+                (0, 5, EventKind::Free),
+            ],
+            6,
+        );
+        let r = analyze(&f);
+        let m = &r.functions[0].metrics;
+        assert_eq!(m.aliasing_pressure_max, 1, "単独束縛の最大は1");
+        assert_eq!(m.aliasing_pressure_sites, 0, "圧力2以上の Site はなし");
+        assert_eq!(m.aliasing_unknown_bindings, 0, "すべて測定可能");
+    }
+
+    #[test]
+    fn aliasing_pressure_two_writable_bindings() {
+        // p = malloc(); q = p;（両方 pointee_const=Some(false)）
+        // → Site Live 中に書込可能束縛2つ → max=2, sites=1
+        let f = func_with_const(
+            &[("p", Some(false)), ("q", Some(false))],
+            vec![
+                (0, 3, heap()),
+                (1, 4, EventKind::AssignFromVar { src: VarId(0) }),
+                (0, 5, EventKind::Free),
+            ],
+            6,
+        );
+        let r = analyze(&f);
+        let m = &r.functions[0].metrics;
+        assert_eq!(
+            m.aliasing_pressure_max, 2,
+            "p と q が同時に同じ Site に書込可能束縛"
+        );
+        assert_eq!(m.aliasing_pressure_sites, 1, "max≥2 な Site は1個");
+        assert_eq!(m.aliasing_unknown_bindings, 0);
+    }
+
+    #[test]
+    fn aliasing_pressure_const_vs_writable() {
+        // p = malloc(); q = p; のとき p が Some(false)（書込可能）だが
+        // q が Some(true)（const）なら、書込可能束縛は p だけ → max=1, sites=0
+        let f = func_with_const(
+            &[("p", Some(false)), ("q", Some(true))],
+            vec![
+                (0, 3, heap()),
+                (1, 4, EventKind::AssignFromVar { src: VarId(0) }),
+                (0, 5, EventKind::Free),
+            ],
+            6,
+        );
+        let r = analyze(&f);
+        let m = &r.functions[0].metrics;
+        assert_eq!(
+            m.aliasing_pressure_max, 1,
+            "const 束縛は書込可能数に数えない"
+        );
+        assert_eq!(m.aliasing_pressure_sites, 0);
+        assert_eq!(m.aliasing_unknown_bindings, 0);
+    }
+
+    #[test]
+    fn aliasing_pressure_unknown_binding() {
+        // p = malloc(); q = p; のとき q が None（測定不能）なら
+        // 書込可能は p だけなので max=1、だが q は unknown カウント
+        let f = func_with_const(
+            &[("p", Some(false)), ("q", None)],
+            vec![
+                (0, 3, heap()),
+                (1, 4, EventKind::AssignFromVar { src: VarId(0) }),
+                (0, 5, EventKind::Free),
+            ],
+            6,
+        );
+        let r = analyze(&f);
+        let m = &r.functions[0].metrics;
+        assert_eq!(m.aliasing_pressure_max, 1, "ここは書込可能1のみ");
+        assert_eq!(m.aliasing_pressure_sites, 0);
+        assert_eq!(m.aliasing_unknown_bindings, 1, "q の None 束縛を可視化");
+    }
+
+    #[test]
+    fn aliasing_pressure_binding_ends_at_free() {
+        // p = malloc(); q = p;（圧力2）→ free(p);（p の束縛終了）→ q はまだ生存
+        // free 後に q が再度 p に関わらないなら、圧力は解放後 Site Live でなくなるので
+        // 最大値に基づく計上は変わらず max=2, sites=1 のまま
+        let f = func_with_const(
+            &[("p", Some(false)), ("q", Some(false))],
+            vec![
+                (0, 3, heap()),
+                (1, 4, EventKind::AssignFromVar { src: VarId(0) }),
+                (0, 5, EventKind::Free),
+                (1, 6, EventKind::AssignNull),
+            ],
+            7,
+        );
+        let r = analyze(&f);
+        let m = &r.functions[0].metrics;
+        assert_eq!(m.aliasing_pressure_max, 2, "free 前の最大値が記録される");
+        assert_eq!(m.aliasing_pressure_sites, 1);
+    }
+
+    #[test]
+    fn aliasing_pressure_three_bindings() {
+        // p = malloc(); q = p; r = p;（3つ全部 Some(false)）
+        // → max=3, sites=1
+        let f = func_with_const(
+            &[("p", Some(false)), ("q", Some(false)), ("r", Some(false))],
+            vec![
+                (0, 3, heap()),
+                (1, 4, EventKind::AssignFromVar { src: VarId(0) }),
+                (2, 5, EventKind::AssignFromVar { src: VarId(0) }),
+                (0, 6, EventKind::Free),
+            ],
+            7,
+        );
+        let r = analyze(&f);
+        let m = &r.functions[0].metrics;
+        assert_eq!(m.aliasing_pressure_max, 3, "3つの書込可能束縛");
+        assert_eq!(m.aliasing_pressure_sites, 1);
     }
 }
