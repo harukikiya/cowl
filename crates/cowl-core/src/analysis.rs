@@ -32,7 +32,9 @@ use std::collections::{BTreeMap, BTreeSet};
 /// 解析レポートのスキーマバージョン（factsとは独立に進化する）
 /// 0.2.0: Free-Site Multiplicity、Live-Range Length、Transfer Density の3指標を追加（フィールド追加のみ）
 /// 0.3.0: Aliasing Pressure（別名圧力）の3指標を追加（フィールド追加のみ）
-pub const REPORT_SCHEMA_VERSION: &str = "0.3.0";
+/// 0.4.0: Aliasing Pressure の計上対象を AddressOf 借用 Site に拡張（ADR-0010・W8-2）
+///        形は不変だが、既存入力の値が増えうるため、対象拡大を自己申告するマイナー版上げ
+pub const REPORT_SCHEMA_VERSION: &str = "0.4.0";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Report {
@@ -204,9 +206,10 @@ pub struct Metrics {
     /// 意図: 「同じリソースに同時に書き込める名前が複数ある」状態は
     ///       Rust の借用規則が禁じる排他性違反に相当し、追跡難度と
     ///       リファクタリング時の退行リスクが高い
-    /// 分子・分母: 全 Site にわたって「その Site に同時に生存した
-    ///       書込可能な束縛（Var）数」の最大値を取ったもの
-    /// 分母0のとき: 0 （ヒープ確保なし。理想値）
+    /// 分子・分母: ヒープ確保 Site と AddressOf 借用 Site の全体にわたって
+    ///       「その Site に同時に生存した書込可能な束縛（Var）数」の最大値
+    ///       （ADR-0010）
+    /// 分母0のとき: 0 （ヒープ確保・借用なし。理想値）
     /// 相関仮説: 別名圧力が2以上の Site ほど、use-after-free や
     ///       データ競争（将来のマルチスレッド対応）のリスクが高いはず
     pub aliasing_pressure_max: u32,
@@ -214,7 +217,8 @@ pub struct Metrics {
     /// **Aliasing Pressure Sites** (圧力2以上の Site 数)
     /// 意図: 「書き込み別名がある」という状態にある Site の数を測る。
     ///       カバレッジ指標と並べて「どの程度危ないのか」を定量化する
-    /// 分子: 「同時最大書込可能束縛数が2以上」の Site 数
+    /// 分子: ヒープ確保と AddressOf 借用の全 Site のうち、
+    ///       「同時最大書込可能束縛数が2以上」の Site 数（ADR-0010）
     /// 分母0のとき: 0 （理想状態）
     /// 相関仮説: 圧力 Site 数が多いほど、全体の所有権複雑性が高く、
     ///       設計見直しのターゲットになるはず
@@ -224,8 +228,9 @@ pub struct Metrics {
     /// 意図: pointee_const = None の Var による束縛をカウント。
     ///       「測れなかった」ことを可視化し、L2/L3 で優先的に
     ///       解決すべき箇所のシグナルにする
-    /// 分子: pointee_const が None のまま束縛が生存した Var-Site 対の
-    ///       総数（時系列集計。同一対が複数回生存すれば複数回カウント）
+    /// 分子: ヒープ確保と AddressOf 借用の両 Site において、
+    ///       pointee_const が None のまま束縛が生存した Var-Site 対の
+    ///       総数（時系列集計。同一対が複数回生存すれば複数回カウント）（ADR-0010）
     /// 分母0のとき: 0 （すべて測定可能。理想値）
     /// 相関仮説: unknown が少ないほど、L1 の構文解析だけで十分に
     ///       信頼度の高い解析ができる（L2 導入の効果も測れる）
@@ -412,6 +417,24 @@ struct SiteState {
     aliasing_pressure_at_site: u32,
 }
 
+/// AddressOf 借用 Site の軽量構造（ヒープ Site と独立に追跡）
+/// sites_total / ownership_coverage / leak判定の分母を汚さないため、
+/// ヒープ sites 配列には混ぜない（ADR-0010）。
+/// 束縛の追跡規則はヒープ Site と同じ
+struct BorrowSite {
+    /// 現在この借用 Site に束縛されている Var → その Var の pointee_const
+    current_bindings: BTreeMap<VarId, Option<bool>>,
+    /// この Site で観測された「同時に生存した書込可能束縛の最大数」
+    /// 書込可能 = pointee_const が Some(false) の束縛
+    aliasing_pressure_at_site: u32,
+}
+
+/// 各変数が借用 Site に束縛しているか追跡する
+/// Var が AddressOf を通じて借用 Site に束縛されている場合、
+/// この変数 VarId に対応する BorrowSite ID を持つ
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+struct BorrowSiteId(u32);
+
 /// 解析エントリポイント：facts 全体 → Report
 pub fn analyze(facts: &Facts) -> Report {
     let mut functions = Vec::new();
@@ -438,6 +461,12 @@ fn analyze_function(f: &FunctionFacts) -> FunctionReport {
     let n = f.vars.len();
     let mut bindings: Vec<Binding> = vec![Binding::Uninit; n];
     let mut sites: Vec<SiteState> = Vec::new();
+    let mut borrow_sites: Vec<BorrowSite> = Vec::new();
+    // Var → BorrowSiteId の対応（変数が借用 Site に束縛している場合）
+    let mut var_to_borrow: Vec<Option<BorrowSiteId>> = vec![None; n];
+    // target 名 → BorrowSiteId の対応（同一 target は同一 BorrowSite に束ねる）
+    let mut borrow_key: std::collections::HashMap<String, BorrowSiteId> =
+        std::collections::HashMap::new();
     let mut issues: Vec<Issue> = Vec::new();
     let mut graph = Graph::default();
     let mut metrics = Metrics::default();
@@ -537,6 +566,51 @@ fn analyze_function(f: &FunctionFacts) -> FunctionReport {
             old_pressure < 2 && ss.aliasing_pressure_at_site >= 2
         };
 
+    // 借用 Site への束縛を開始する（W8-2）。pointee_const が None なら unknown をカウント
+    let bind_to_borrow = |borrow_sites: &mut Vec<BorrowSite>,
+                          borrow_id: BorrowSiteId,
+                          var_id: VarId,
+                          pointee_const: Option<bool>,
+                          metrics: &mut Metrics| {
+        let bs = &mut borrow_sites[borrow_id.0 as usize];
+        bs.current_bindings.insert(var_id, pointee_const);
+        if pointee_const.is_none() {
+            metrics.aliasing_unknown_bindings += 1;
+        }
+    };
+
+    // 借用 Site からの束縛を解除する（W8-2）
+    let unbind_from_borrow =
+        |borrow_sites: &mut Vec<BorrowSite>, borrow_id: BorrowSiteId, var_id: VarId| {
+            let bs = &mut borrow_sites[borrow_id.0 as usize];
+            bs.current_bindings.remove(&var_id);
+        };
+
+    // 借用 Site の現在の書込可能束縛を数え、最大値を更新する（W8-2）。
+    // 借用 Site は常に「生存」状態と見なす（free されないため）。
+    // 返り値：true なら最大値が初めて2以上に達した（aliasing_pressure_sites のカウント対象）
+    let update_aliasing_pressure_borrow = |borrow_sites: &mut Vec<BorrowSite>,
+                                           borrow_id: BorrowSiteId,
+                                           metrics: &mut Metrics|
+     -> bool {
+        let bs = &mut borrow_sites[borrow_id.0 as usize];
+        // 現在の書込可能束縛数を数える（pointee_const = Some(false) のみ）
+        let writable_count = bs
+            .current_bindings
+            .values()
+            .filter(|pc| matches!(pc, Some(false)))
+            .count() as u32;
+        // 最大値を更新
+        let old_pressure = bs.aliasing_pressure_at_site;
+        bs.aliasing_pressure_at_site = bs.aliasing_pressure_at_site.max(writable_count);
+        // グローバル最大値を更新（ヒープと借用の全体最大）
+        metrics.aliasing_pressure_max = metrics
+            .aliasing_pressure_max
+            .max(bs.aliasing_pressure_at_site);
+        // 最大値が初めて2以上に達した場合は true を返す
+        old_pressure < 2 && bs.aliasing_pressure_at_site >= 2
+    };
+
     // 全変数のフェーズを再計算し、変化した変数のセグメントを line で切り替える。
     // 「イベントの行から新フェーズが始まる」規約（確保行はもうOwned色で塗る）
     macro_rules! commit_phases {
@@ -606,10 +680,10 @@ fn analyze_function(f: &FunctionFacts) -> FunctionReport {
                     }
                 }
                 // Alloc はどの source でも vi の旧束縛を終わらせる（Heap なら
-                // 新 Site へ、AddressOf なら Borrow へ上書き）。だから旧 Site
+                // 新 Site へ、AddressOf なら借用 Site へ上書き）。だから旧束縛
                 // からの解除は分岐に入る前にここで共通に行う（AssignFromVar /
-                // AssignNull / AssignOpaque の各分岐と対称）。この対称性を
-                // 欠くと旧 Site の current_bindings に stale な束縛が残り、
+                // AssignNull / AssignOpaque の各分岐と対称。W8-2で借用解除も追加）。
+                // この対称性を欠くと旧 Site の current_bindings に stale な束縛が残り、
                 // 以後その Site に別の変数が束縛されたとき、もう指していない
                 // 変数まで書込可能数に数えて別名圧力を過大計上してしまう
                 if let Binding::Site { site: old_site, .. } = bindings[vi] {
@@ -617,6 +691,18 @@ fn analyze_function(f: &FunctionFacts) -> FunctionReport {
                     if update_aliasing_pressure(&mut sites, old_site, &mut metrics) {
                         metrics.aliasing_pressure_sites += 1;
                     }
+                }
+                // W8-2: 前の借用 Site からも解除
+                if let Some(old_borrow_id) = var_to_borrow[vi] {
+                    unbind_from_borrow(&mut borrow_sites, old_borrow_id, VarId(vi as u32));
+                    if update_aliasing_pressure_borrow(
+                        &mut borrow_sites,
+                        old_borrow_id,
+                        &mut metrics,
+                    ) {
+                        metrics.aliasing_pressure_sites += 1;
+                    }
+                    var_to_borrow[vi] = None;
                 }
                 match source {
                     AllocSource::Heap { func } => {
@@ -671,10 +757,49 @@ fn analyze_function(f: &FunctionFacts) -> FunctionReport {
                             note: format!("{} で確保", func),
                         });
                     }
-                    // target（ADR-0010/W8-1）は圧力計上側の拡張（次段）が使う。
-                    // この段では facts の形に追随するだけで、束縛の遷移
-                    // （Borrowへの上書き）自体は1ビットも変えない
-                    AllocSource::AddressOf { .. } => {
+                    // W8-2: AddressOf の target により借用 Site を作成・共有
+                    AllocSource::AddressOf { target } => {
+                        let pointee_const = f.vars[vi].pointee_const;
+                        let borrow_id = match target {
+                            Some(target_name) => {
+                                // target が Some のとき: 同じ target 名は同じ借用 Site に束ねる
+                                let next_id = BorrowSiteId(borrow_sites.len() as u32);
+                                *borrow_key.entry(target_name.clone()).or_insert_with(|| {
+                                    borrow_sites.push(BorrowSite {
+                                        current_bindings: BTreeMap::new(),
+                                        aliasing_pressure_at_site: 0,
+                                    });
+                                    next_id
+                                })
+                            }
+                            None => {
+                                // target が None のとき: 複合式なので出現ごとに新規 Site
+                                let next_id = BorrowSiteId(borrow_sites.len() as u32);
+                                borrow_sites.push(BorrowSite {
+                                    current_bindings: BTreeMap::new(),
+                                    aliasing_pressure_at_site: 0,
+                                });
+                                next_id
+                            }
+                        };
+                        // 新規に束縛を追加
+                        bind_to_borrow(
+                            &mut borrow_sites,
+                            borrow_id,
+                            VarId(vi as u32),
+                            pointee_const,
+                            &mut metrics,
+                        );
+                        // 圧力を更新
+                        if update_aliasing_pressure_borrow(
+                            &mut borrow_sites,
+                            borrow_id,
+                            &mut metrics,
+                        ) {
+                            metrics.aliasing_pressure_sites += 1;
+                        }
+                        // 変数→借用 Site の対応を記録
+                        var_to_borrow[vi] = Some(borrow_id);
                         bindings[vi] = Binding::Borrow;
                         marks[vi].push(Mark {
                             line,
@@ -693,6 +818,18 @@ fn analyze_function(f: &FunctionFacts) -> FunctionReport {
                     if update_aliasing_pressure(&mut sites, old_site, &mut metrics) {
                         metrics.aliasing_pressure_sites += 1;
                     }
+                }
+                // W8-2: 前の借用 Site からも解除
+                if let Some(old_borrow_id) = var_to_borrow[vi] {
+                    unbind_from_borrow(&mut borrow_sites, old_borrow_id, VarId(vi as u32));
+                    if update_aliasing_pressure_borrow(
+                        &mut borrow_sites,
+                        old_borrow_id,
+                        &mut metrics,
+                    ) {
+                        metrics.aliasing_pressure_sites += 1;
+                    }
+                    var_to_borrow[vi] = None;
                 }
 
                 match bindings[si] {
@@ -722,7 +859,28 @@ fn analyze_function(f: &FunctionFacts) -> FunctionReport {
                             kind: GEdgeKind::Assign,
                         });
                     }
-                    Binding::Borrow => bindings[vi] = Binding::Borrow,
+                    Binding::Borrow => {
+                        // W8-2: src が借用に束縛されていれば、dst もその借用 Site に束ねる
+                        if let Some(src_borrow_id) = var_to_borrow[si] {
+                            let pointee_const = f.vars[vi].pointee_const;
+                            bind_to_borrow(
+                                &mut borrow_sites,
+                                src_borrow_id,
+                                VarId(vi as u32),
+                                pointee_const,
+                                &mut metrics,
+                            );
+                            if update_aliasing_pressure_borrow(
+                                &mut borrow_sites,
+                                src_borrow_id,
+                                &mut metrics,
+                            ) {
+                                metrics.aliasing_pressure_sites += 1;
+                            }
+                            var_to_borrow[vi] = Some(src_borrow_id);
+                        }
+                        bindings[vi] = Binding::Borrow;
+                    }
                     Binding::Null => bindings[vi] = Binding::Null,
                     _ => bindings[vi] = Binding::Opaque,
                 }
@@ -737,6 +895,18 @@ fn analyze_function(f: &FunctionFacts) -> FunctionReport {
                     if update_aliasing_pressure(&mut sites, site, &mut metrics) {
                         metrics.aliasing_pressure_sites += 1;
                     }
+                }
+                // W8-2: 借用 Site からも解除
+                if let Some(old_borrow_id) = var_to_borrow[vi] {
+                    unbind_from_borrow(&mut borrow_sites, old_borrow_id, VarId(vi as u32));
+                    if update_aliasing_pressure_borrow(
+                        &mut borrow_sites,
+                        old_borrow_id,
+                        &mut metrics,
+                    ) {
+                        metrics.aliasing_pressure_sites += 1;
+                    }
+                    var_to_borrow[vi] = None;
                 }
                 bindings[vi] = Binding::Null;
             }
@@ -756,6 +926,18 @@ fn analyze_function(f: &FunctionFacts) -> FunctionReport {
                     if update_aliasing_pressure(&mut sites, site, &mut metrics) {
                         metrics.aliasing_pressure_sites += 1;
                     }
+                }
+                // W8-2: 借用 Site からも解除
+                if let Some(old_borrow_id) = var_to_borrow[vi] {
+                    unbind_from_borrow(&mut borrow_sites, old_borrow_id, VarId(vi as u32));
+                    if update_aliasing_pressure_borrow(
+                        &mut borrow_sites,
+                        old_borrow_id,
+                        &mut metrics,
+                    ) {
+                        metrics.aliasing_pressure_sites += 1;
+                    }
+                    var_to_borrow[vi] = None;
                 }
                 // 由来不明の値は以後追跡不能。free されても正当性を判断できない
                 bindings[vi] = Binding::Opaque;
@@ -863,12 +1045,25 @@ fn analyze_function(f: &FunctionFacts) -> FunctionReport {
                         }
                     }
                     Binding::Borrow => {
+                        // W8-2: free(借用) は invalid だが、束縛は終わらせる（ADR-0010）
                         push_issue!(
                             IssueKind::FreeInvalid,
                             line,
                             vname.clone(),
                             "&x 由来のポインタ（借用）を free しています".into()
                         );
+                        // 借用 Site からの束縛を解除
+                        if let Some(borrow_id) = var_to_borrow[vi] {
+                            unbind_from_borrow(&mut borrow_sites, borrow_id, VarId(vi as u32));
+                            if update_aliasing_pressure_borrow(
+                                &mut borrow_sites,
+                                borrow_id,
+                                &mut metrics,
+                            ) {
+                                metrics.aliasing_pressure_sites += 1;
+                            }
+                            var_to_borrow[vi] = None;
+                        }
                         marks[vi].push(Mark {
                             line,
                             kind: MarkKind::Issue,
@@ -916,6 +1111,18 @@ fn analyze_function(f: &FunctionFacts) -> FunctionReport {
                             label: format!("move: {}", callee),
                             kind: GEdgeKind::Move,
                         });
+                    }
+                    // W8-2: 消費される借用も束縛終了
+                    if let Some(borrow_id) = var_to_borrow[vi] {
+                        unbind_from_borrow(&mut borrow_sites, borrow_id, VarId(vi as u32));
+                        if update_aliasing_pressure_borrow(
+                            &mut borrow_sites,
+                            borrow_id,
+                            &mut metrics,
+                        ) {
+                            metrics.aliasing_pressure_sites += 1;
+                        }
+                        var_to_borrow[vi] = None;
                     }
                     marks[vi].push(Mark {
                         line,
@@ -983,6 +1190,14 @@ fn analyze_function(f: &FunctionFacts) -> FunctionReport {
                         kind: GEdgeKind::Escape,
                     });
                 }
+                // W8-2: 脱出する借用も束縛終了
+                if let Some(borrow_id) = var_to_borrow[vi] {
+                    unbind_from_borrow(&mut borrow_sites, borrow_id, VarId(vi as u32));
+                    if update_aliasing_pressure_borrow(&mut borrow_sites, borrow_id, &mut metrics) {
+                        metrics.aliasing_pressure_sites += 1;
+                    }
+                    var_to_borrow[vi] = None;
+                }
                 marks[vi].push(Mark {
                     line,
                     kind: MarkKind::Escape,
@@ -1012,6 +1227,14 @@ fn analyze_function(f: &FunctionFacts) -> FunctionReport {
                         label: format!("store: {}", target),
                         kind: GEdgeKind::Escape,
                     });
+                }
+                // W8-2: 格納される借用も束縛終了
+                if let Some(borrow_id) = var_to_borrow[vi] {
+                    unbind_from_borrow(&mut borrow_sites, borrow_id, VarId(vi as u32));
+                    if update_aliasing_pressure_borrow(&mut borrow_sites, borrow_id, &mut metrics) {
+                        metrics.aliasing_pressure_sites += 1;
+                    }
+                    var_to_borrow[vi] = None;
                 }
                 marks[vi].push(Mark {
                     line,
@@ -1179,6 +1402,16 @@ mod tests {
         EventKind::Alloc {
             source: AllocSource::Heap {
                 func: "malloc".into(),
+            },
+        }
+    }
+
+    /// W8-2: AddressOf (借用) イベントを生成する。target がある場合は Some で、
+    /// 複合式の場合は None で生成
+    fn borrow_of(target: Option<&str>) -> EventKind {
+        EventKind::Alloc {
+            source: AllocSource::AddressOf {
+                target: target.map(|s| s.to_string()),
             },
         }
     }
@@ -2012,5 +2245,160 @@ mod tests {
             "&x 再代入で A から外れた p を数えてはいけない（stale なら3になる）"
         );
         assert_eq!(m.aliasing_pressure_sites, 1, "圧力2以上は Site A のみ");
+    }
+
+    // --- W8-2: 借用 Site の別名圧力計上テスト ---
+
+    #[test]
+    fn borrow_site_same_target_is_bundled() {
+        // W8-2: int *p = &x; int *q = &x; → 同じ target は同じ借用 Site に束ねる
+        // → max=2, sites=1
+        let f = func_with_const(
+            &[("p", Some(false)), ("q", Some(false))],
+            vec![(0, 3, borrow_of(Some("x"))), (1, 4, borrow_of(Some("x")))],
+            5,
+        );
+        let r = analyze(&f);
+        let m = &r.functions[0].metrics;
+        assert_eq!(
+            m.aliasing_pressure_max, 2,
+            "同じ target &x を2つ束ねた借用 Site"
+        );
+        assert_eq!(m.aliasing_pressure_sites, 1, "圧力2以上の借用 Site は1個");
+    }
+
+    #[test]
+    fn borrow_site_different_targets_separate() {
+        // W8-2: &x と &y は異なる target → 異なる借用 Site に分ける
+        // → max=1, sites=0 （圧力2未満）
+        let f = func_with_const(
+            &[("p", Some(false)), ("q", Some(false))],
+            vec![(0, 3, borrow_of(Some("x"))), (1, 4, borrow_of(Some("y")))],
+            5,
+        );
+        let r = analyze(&f);
+        let m = &r.functions[0].metrics;
+        assert_eq!(
+            m.aliasing_pressure_max, 1,
+            "異なる target は異なる Site なので max=1"
+        );
+        assert_eq!(
+            m.aliasing_pressure_sites, 0,
+            "どの Site も圧力1のため sites=0"
+        );
+    }
+
+    #[test]
+    fn borrow_site_const_target_reduces_pressure() {
+        // W8-2: int *const q = &x; だと pointee_const=Some(true)
+        // → q は書込可能ではない。p = &x; で max=1, sites=0
+        let f = func_with_const(
+            &[("p", Some(false)), ("q", Some(true))],
+            vec![(0, 3, borrow_of(Some("x"))), (1, 4, borrow_of(Some("x")))],
+            5,
+        );
+        let r = analyze(&f);
+        let m = &r.functions[0].metrics;
+        assert_eq!(m.aliasing_pressure_max, 1, "p だけが書込可能なので max=1");
+        assert_eq!(m.aliasing_pressure_sites, 0, "圧力1未満のため sites=0");
+    }
+
+    #[test]
+    fn borrow_site_none_target_each_time_separate() {
+        // W8-2: &arr[i] / &s.field のような複合式は target=None
+        // → 出現ごとに新規 Site。2回出現で max=1, sites=0
+        let f = func_with_const(
+            &[("p", Some(false)), ("q", Some(false))],
+            vec![(0, 3, borrow_of(None)), (1, 4, borrow_of(None))],
+            5,
+        );
+        let r = analyze(&f);
+        let m = &r.functions[0].metrics;
+        assert_eq!(
+            m.aliasing_pressure_max, 1,
+            "None target は出現ごとに新規 Site なので max=1"
+        );
+        assert_eq!(
+            m.aliasing_pressure_sites, 0,
+            "どの Site も圧力1のため sites=0"
+        );
+    }
+
+    #[test]
+    fn borrow_site_propagate_via_assignfromvar() {
+        // W8-2: p = &x; q = p; → q も &x の借用 Site に束ねられる
+        // → max=2, sites=1
+        let f = func_with_const(
+            &[("p", Some(false)), ("q", Some(false))],
+            vec![
+                (0, 3, borrow_of(Some("x"))),
+                (1, 4, EventKind::AssignFromVar { src: VarId(0) }),
+            ],
+            5,
+        );
+        let r = analyze(&f);
+        let m = &r.functions[0].metrics;
+        assert_eq!(
+            m.aliasing_pressure_max, 2,
+            "q が p 経由で &x 借用 Site に伝播"
+        );
+        assert_eq!(m.aliasing_pressure_sites, 1, "借用 Site 1個が圧力2に達した");
+    }
+
+    #[test]
+    fn borrow_site_stale_unbind_on_null() {
+        // W8-2: p = &x; q = &x; (max=2, sites=1) → p = NULL; r = &x;
+        // → 真の最大は2。p の unbind により、p = NULL 後の &x は r だけ
+        // つまり max は2のまま（3にはならない）
+        let f = func_with_const(
+            &[("p", Some(false)), ("q", Some(false)), ("r", Some(false))],
+            vec![
+                (0, 3, borrow_of(Some("x"))),
+                (1, 4, borrow_of(Some("x"))),
+                (0, 5, EventKind::AssignNull),
+                (2, 6, borrow_of(Some("x"))),
+            ],
+            7,
+        );
+        let r = analyze(&f);
+        let m = &r.functions[0].metrics;
+        assert_eq!(
+            m.aliasing_pressure_max, 2,
+            "null 後の新規束縛が max を増やさない（stale unbind が効く）"
+        );
+        assert_eq!(m.aliasing_pressure_sites, 1, "借用 Site は1個のまま");
+    }
+
+    #[test]
+    fn borrow_and_heap_mixed_independence() {
+        // W8-2: ヒープ Site と借用 Site が独立に計上される
+        // p = malloc(); q = p; (heap site: max=2) + r = &x; s = &x; (borrow: max=2)
+        // → 両 Site の全体最大 = 2
+        let f = func_with_const(
+            &[
+                ("p", Some(false)),
+                ("q", Some(false)),
+                ("r", Some(false)),
+                ("s", Some(false)),
+            ],
+            vec![
+                (0, 3, heap()),
+                (1, 4, EventKind::AssignFromVar { src: VarId(0) }),
+                (2, 5, borrow_of(Some("x"))),
+                (3, 6, borrow_of(Some("x"))),
+                (0, 7, EventKind::Free),
+            ],
+            8,
+        );
+        let r = analyze(&f);
+        let m = &r.functions[0].metrics;
+        assert_eq!(
+            m.aliasing_pressure_max, 2,
+            "ヒープ max=2, 借用 max=2 → 全体 max=2"
+        );
+        assert_eq!(
+            m.aliasing_pressure_sites, 2,
+            "圧力2以上の Site は heap 1個 + borrow 1個 = 2個"
+        );
     }
 }
